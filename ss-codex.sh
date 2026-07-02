@@ -748,6 +748,73 @@ fq_state() {
     [ "$qdisc" = "fq" ] && echo "已启用" || echo "未启用"
 }
 
+print_ipv4_dns_from_resolvectl() {
+    command -v resolvectl >/dev/null 2>&1 || return 1
+
+    local found=1
+    local seen=" "
+    local line
+    local token
+    local ip
+
+    while IFS= read -r line; do
+        line="${line#*:}"
+        for token in $line; do
+            ip="${token%%%*}"
+            ip="${ip%#*}"
+            if is_ipv4_address "$ip"; then
+                case "$seen" in
+                    *" $ip "*) ;;
+                    *)
+                        printf ' nameserver %s\n' "$ip"
+                        seen="${seen}${ip} "
+                        found=0
+                        ;;
+                esac
+            fi
+        done
+    done < <(resolvectl dns 2>/dev/null)
+
+    return "$found"
+}
+
+print_ipv4_dns_from_resolv_conf() {
+    [ -r /etc/resolv.conf ] || return 1
+
+    local found=1
+    local seen=" "
+    local keyword
+    local ip
+
+    while read -r keyword ip _; do
+        [ "$keyword" = "nameserver" ] || continue
+        if is_ipv4_address "$ip"; then
+            case "$seen" in
+                *" $ip "*) ;;
+                *)
+                    printf ' nameserver %s\n' "$ip"
+                    seen="${seen}${ip} "
+                    found=0
+                    ;;
+            esac
+        fi
+    done < /etc/resolv.conf
+
+    return "$found"
+}
+
+ipv4_dns_lines() {
+    if print_ipv4_dns_from_resolvectl; then
+        return 0
+    fi
+
+    if print_ipv4_dns_from_resolv_conf; then
+        return 0
+    fi
+
+    echo " 未检测到 IPv4 DNS"
+}
+
 enable_bbr_fq() {
     cat > "$BBR_CONF" <<EOF
 net.core.default_qdisc=fq
@@ -843,6 +910,8 @@ show_menu() {
  BBR：$(bbr_state)
  fq：$(fq_state)
  当前节点：$(node_state)
+ IPv4 DNS：
+$(ipv4_dns_lines)
 ----------------------------------------
  1) 创建/重建 SS 2022 节点
  2) 查看节点链接
