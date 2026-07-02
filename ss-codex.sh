@@ -760,6 +760,50 @@ fq_state() {
     [ "$qdisc" = "fq" ] && echo "已启用" || echo "未启用"
 }
 
+fail2ban_installed() {
+    command -v fail2ban-client >/dev/null 2>&1
+}
+
+fail2ban_install_state() {
+    fail2ban_installed && echo "已安装" || echo "未安装"
+}
+
+fail2ban_service_state() {
+    if ! fail2ban_installed; then
+        echo "未运行"
+        return
+    fi
+
+    if is_systemd; then
+        if systemctl is-active --quiet fail2ban 2>/dev/null; then
+            echo "运行中"
+        else
+            echo "未运行"
+        fi
+    elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
+        if rc-service fail2ban status >/dev/null 2>&1; then
+            echo "运行中"
+        else
+            echo "未运行"
+        fi
+    else
+        echo "未知"
+    fi
+}
+
+fail2ban_sshd_state() {
+    if ! fail2ban_installed; then
+        echo "未启用"
+        return
+    fi
+
+    if fail2ban-client status sshd >/dev/null 2>&1; then
+        echo "已启用"
+    else
+        echo "未启用"
+    fi
+}
+
 print_ipv4_dns_from_resolvectl() {
     command -v resolvectl >/dev/null 2>&1 || return 1
 
@@ -836,6 +880,74 @@ EOF
     echo ""
     info "当前 BBR：$(bbr_state)"
     info "当前 fq：$(fq_state)"
+}
+
+install_fail2ban() {
+    info "正在安装 Fail2ban..."
+
+    detect_os
+    case "$OS" in
+        debian)
+            export DEBIAN_FRONTEND=noninteractive
+            if ! apt update || ! apt install -y fail2ban || ! systemctl enable --now fail2ban; then
+                warn "Fail2ban 安装或启动未完全成功，将尝试写入最小 SSH 配置后重启。"
+            fi
+            ;;
+        alpine)
+            if ! apk update || ! apk add --no-cache fail2ban; then
+                err "Fail2ban 安装失败。"
+                return 1
+            fi
+            if command -v rc-update >/dev/null 2>&1; then
+                rc-update add fail2ban default >/dev/null 2>&1 || true
+            fi
+            if command -v rc-service >/dev/null 2>&1; then
+                rc-service fail2ban start || true
+            fi
+            ;;
+        redhat)
+            if command -v dnf >/dev/null 2>&1; then
+                dnf install -y fail2ban || { err "Fail2ban 安装失败。"; return 1; }
+            else
+                yum install -y fail2ban || { err "Fail2ban 安装失败。"; return 1; }
+            fi
+            if is_systemd; then
+                systemctl enable --now fail2ban || true
+            fi
+            ;;
+        *)
+            err "未识别系统类型，无法自动安装 Fail2ban。"
+            return 1
+            ;;
+    esac
+
+    if ! fail2ban_installed; then
+        err "Fail2ban 未安装成功，请检查软件源或网络。"
+        return 1
+    fi
+
+    if [ "$(fail2ban_service_state)" = "运行中" ] && [ "$(fail2ban_sshd_state)" = "已启用" ]; then
+        info "Fail2ban 已安装，SSH 防护已启用。"
+        return 0
+    fi
+
+    warn "Fail2ban 已安装，但 SSH 防护未正常启用，正在写入最小 SSH 配置..."
+    mkdir -p /etc/fail2ban/jail.d
+    cat > /etc/fail2ban/jail.d/sshd.local <<'EOF'
+[sshd]
+enabled = true
+port = 22
+backend = systemd
+EOF
+
+    if is_systemd; then
+        systemctl restart fail2ban || { err "Fail2ban 重启失败，请执行 journalctl -u fail2ban -n 50 --no-pager 查看原因。"; return 1; }
+    elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
+        rc-service fail2ban restart || { err "Fail2ban 重启失败。"; return 1; }
+    fi
+
+    info "Fail2ban 状态：$(fail2ban_service_state)"
+    info "SSH 防护：$(fail2ban_sshd_state)"
 }
 
 uninstall_all() {
@@ -921,6 +1033,9 @@ show_menu() {
  版本：$(singbox_version)
  BBR：$(bbr_state)
  fq：$(fq_state)
+ Fail2ban：$(fail2ban_install_state)
+ Fail2ban 状态：$(fail2ban_service_state)
+ SSH 防护：$(fail2ban_sshd_state)
  当前节点：$(node_state)
  IPv4 DNS：
 $(ipv4_dns_lines)
@@ -936,9 +1051,10 @@ $(ipv4_dns_lines)
  8) 查看 sing-box 日志
 ----------------------------------------
  9) 一键开启 BBR + fq
-10) 更新 sing-box
-11) 更新 sscodex 脚本
-12) 卸载 SS Codex
+10) 安装 Fail2ban
+11) 更新 sing-box
+12) 更新 sscodex 脚本
+13) 卸载 SS Codex
  0) 退出
 ========================================
 EOF
@@ -960,9 +1076,10 @@ main_loop() {
             7) show_service_status; pause ;;
             8) show_logs ;;
             9) enable_bbr_fq; pause ;;
-            10) update_singbox; pause ;;
-            11) update_sscodex; pause ;;
-            12) uninstall_all; pause ;;
+            10) install_fail2ban; pause ;;
+            11) update_singbox; pause ;;
+            12) update_sscodex; pause ;;
+            13) uninstall_all; pause ;;
             0) exit 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
