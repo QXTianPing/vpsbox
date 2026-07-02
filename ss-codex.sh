@@ -572,6 +572,48 @@ update_singbox() {
     info "更新完成：$(singbox_version)"
 }
 
+update_sscodex() {
+    local tmp
+
+    if ! command -v curl >/dev/null 2>&1; then
+        info "未检测到 curl，正在安装依赖..."
+        install_deps
+    fi
+
+    if ! command -v curl >/dev/null 2>&1; then
+        err "未找到 curl，无法更新 sscodex。"
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$CMD_PATH")"
+    if command -v mktemp >/dev/null 2>&1; then
+        tmp="$(mktemp "${CMD_PATH}.tmp.XXXXXX")"
+    else
+        tmp="${CMD_PATH}.tmp.$$"
+        : > "$tmp"
+    fi
+
+    info "正在下载最新 sscodex 脚本..."
+    if ! curl -fsSL "$SCRIPT_URL" -o "$tmp"; then
+        rm -f "$tmp"
+        err "下载失败，请检查网络或 GitHub raw 地址。"
+        return 1
+    fi
+
+    if ! bash -n "$tmp"; then
+        rm -f "$tmp"
+        err "下载到的脚本未通过语法检查，已保留当前版本。"
+        return 1
+    fi
+
+    chmod 755 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$CMD_PATH"
+    install_command_alias
+
+    info "sscodex 已覆盖更新。"
+    info "再次输入 sscodex 可打开新版管理面板。"
+}
+
 bbr_state() {
     local cc
     cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")"
@@ -690,7 +732,8 @@ show_menu() {
 ----------------------------------------
  9) 一键开启 BBR + fq
 10) 更新 sing-box
-11) 卸载 sing-box，并删除所有节点配置
+11) 更新 sscodex 脚本
+12) 卸载 sing-box，并删除所有节点配置
  0) 退出
 ========================================
 EOF
@@ -713,7 +756,8 @@ main_loop() {
             8) show_logs ;;
             9) enable_bbr_fq; pause ;;
             10) update_singbox; pause ;;
-            11) uninstall_all; pause ;;
+            11) update_sscodex; pause ;;
+            12) uninstall_all; pause ;;
             0) exit 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
