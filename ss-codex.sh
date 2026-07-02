@@ -282,10 +282,27 @@ save_state() {
 
 normalize_host() {
     local host="$1"
+    local no_colons
+    local colon_count
+
     host="$(echo "$host" | tr -d '[:space:]')"
     host="${host#http://}"
     host="${host#https://}"
     host="${host%%/*}"
+    host="${host%%\?*}"
+    host="${host%%#*}"
+
+    if [[ "$host" == \[*\]* ]]; then
+        host="${host#\[}"
+        host="${host%%\]*}"
+    else
+        no_colons="${host//:/}"
+        colon_count=$((${#host} - ${#no_colons}))
+        if [ "$colon_count" -eq 1 ] && [[ "${host##*:}" =~ ^[0-9]+$ ]]; then
+            host="${host%:*}"
+        fi
+    fi
+
     echo "$host"
 }
 
