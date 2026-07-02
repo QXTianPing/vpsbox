@@ -735,7 +735,7 @@ show_menu() {
  9) 一键开启 BBR + fq
 10) 更新 sing-box
 11) 更新 sscodex 脚本
-12) 卸载 SS Codex、sing-box，并删除所有节点配置
+12) 卸载 SS Codex
  0) 退出
 ========================================
 EOF
