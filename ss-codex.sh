@@ -55,6 +55,11 @@ is_systemd() {
     command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
 }
 
+install_command_alias() {
+    chmod 755 "$CMD_PATH" 2>/dev/null || true
+    ln -sf "$CMD_PATH" /usr/bin/sscodex 2>/dev/null || true
+}
+
 install_self_command() {
     local src
     src="${BASH_SOURCE[0]:-$0}"
@@ -68,7 +73,7 @@ install_self_command() {
                     warn "管理命令安装失败，可重新运行安装命令。"
                     return 0
                 }
-                chmod 755 "$CMD_PATH" 2>/dev/null || true
+                install_command_alias
                 return 0
             fi
             warn "未找到 curl，暂时无法安装 sscodex 管理命令。"
@@ -80,7 +85,9 @@ install_self_command() {
 
     if [ "$(readlink -f "$src" 2>/dev/null || echo "$src")" != "$CMD_PATH" ]; then
         cp "$src" "$CMD_PATH" 2>/dev/null || true
-        chmod 755 "$CMD_PATH" 2>/dev/null || true
+        install_command_alias
+    else
+        install_command_alias
     fi
 }
 
@@ -362,6 +369,11 @@ write_config() {
     local password="$2"
 
     secure_config_dir
+    if [ -f "$CONFIG_PATH" ]; then
+        cp "$CONFIG_PATH" "${CONFIG_PATH}.bak" 2>/dev/null || true
+        chmod 600 "${CONFIG_PATH}.bak" 2>/dev/null || true
+    fi
+
     cat > "$CONFIG_PATH" <<EOF
 {
   "log": {
@@ -599,7 +611,7 @@ uninstall_all() {
     rm -f /usr/bin/sing-box /usr/local/bin/sing-box
     rm -f "$CMD_PATH" /usr/bin/sscodex
     rm -f /usr/local/bin/sb /usr/bin/sb
-    rm -f /var/log/sing-box.log /var/log/sing-box.err
+    rm -f /var/log/sing-box*
 
     info "卸载完成。"
 }
