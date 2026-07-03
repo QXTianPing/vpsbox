@@ -4,15 +4,11 @@ set -euo pipefail
 APP_NAME="VPSBox"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 CMD_PATH="/usr/local/bin/vpsbox"
-LEGACY_CMD_PATH="/usr/local/bin/sscodex"
 CONFIG_DIR="/etc/sing-box"
 CONFIG_PATH="$CONFIG_DIR/config.json"
 STATE_FILE="$CONFIG_DIR/vpsbox.env"
-LEGACY_STATE_FILE="$CONFIG_DIR/ss-codex.env"
 URI_FILE="$CONFIG_DIR/vpsbox-uri.txt"
-LEGACY_URI_FILE="$CONFIG_DIR/ss-codex-uri.txt"
 BBR_CONF="/etc/sysctl.d/99-vpsbox-bbr.conf"
-LEGACY_BBR_CONF="/etc/sysctl.d/99-ss-codex-bbr.conf"
 LOCK_FILE="/var/lock/vpsbox.lock"
 LOCK_DIR="/tmp/vpsbox.lock"
 SERVICE_NAME="sing-box"
@@ -93,8 +89,6 @@ is_systemd() {
 install_command_alias() {
     chmod 755 "$CMD_PATH" 2>/dev/null || true
     ln -sf "$CMD_PATH" /usr/bin/vpsbox 2>/dev/null || true
-    ln -sf "$CMD_PATH" "$LEGACY_CMD_PATH" 2>/dev/null || true
-    ln -sf "$CMD_PATH" /usr/bin/sscodex 2>/dev/null || true
 }
 
 ensure_curl() {
@@ -173,18 +167,6 @@ install_self_command() {
 secure_config_dir() {
     mkdir -p "$CONFIG_DIR"
     chmod 700 "$CONFIG_DIR" 2>/dev/null || true
-}
-
-migrate_legacy_files() {
-    secure_config_dir
-
-    if [ ! -f "$STATE_FILE" ] && [ -f "$LEGACY_STATE_FILE" ]; then
-        cp -a "$LEGACY_STATE_FILE" "$STATE_FILE" 2>/dev/null || true
-    fi
-
-    if [ ! -f "$URI_FILE" ] && [ -f "$LEGACY_URI_FILE" ]; then
-        cp -a "$LEGACY_URI_FILE" "$URI_FILE" 2>/dev/null || true
-    fi
 }
 
 install_deps() {
@@ -1547,10 +1529,10 @@ uninstall_all() {
     info "正在清理文件..."
     rm -rf "$CONFIG_DIR"
     rm -f /usr/bin/sing-box /usr/local/bin/sing-box
-    rm -f "$CMD_PATH" /usr/bin/vpsbox "$LEGACY_CMD_PATH" /usr/bin/sscodex
+    rm -f "$CMD_PATH" /usr/bin/vpsbox
     rm -f /usr/local/bin/sb /usr/bin/sb
     rm -f /var/log/sing-box*
-    rm -f "$BBR_CONF" "$LEGACY_BBR_CONF"
+    rm -f "$BBR_CONF"
 
     info "卸载完成。"
     info "vpsbox 命令已删除，当前菜单即将退出。"
@@ -1676,6 +1658,8 @@ limit_systemd_journal() {
     systemctl restart systemd-journald
     info "systemd 日志限制已设置。"
     info "当前日志占用：$(journal_disk_usage)"
+    info "总大小：500M"
+    info "单文件：50M"
 }
 
 show_system_maintenance_status() {
@@ -1714,7 +1698,7 @@ show_menu() {
 ========================================
  VPSBox
 ========================================
- 提示：输入 vpsbox 打开管理面板，旧命令 sscodex 仍可兼容使用
+ 提示：输入 vpsbox 打开管理面板
 ----------------------------------------
  sing-box：$(singbox_install_state)
  sing-box 状态：$(service_status_short)
@@ -1789,5 +1773,4 @@ need_root
 detect_os
 acquire_lock
 install_self_command
-migrate_legacy_files
 main_loop

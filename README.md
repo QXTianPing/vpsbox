@@ -16,8 +16,6 @@ bash <(curl -fsSL https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbo
 vpsbox
 ```
 
-旧命令 `sscodex` 会作为兼容入口保留。
-
 ## 主界面
 
 输入 `vpsbox` 打开管理面板：
@@ -26,7 +24,7 @@ vpsbox
 ========================================
  VPSBox
 ========================================
- 提示：输入 vpsbox 打开管理面板，旧命令 sscodex 仍可兼容使用
+ 提示：输入 vpsbox 打开管理面板
 ----------------------------------------
  sing-box：已安装 / 未安装
  sing-box 状态：运行中 / 未运行
