@@ -9,6 +9,8 @@ CONFIG_PATH="$CONFIG_DIR/config.json"
 STATE_FILE="$CONFIG_DIR/ss-codex.env"
 URI_FILE="$CONFIG_DIR/ss-codex-uri.txt"
 BBR_CONF="/etc/sysctl.d/99-ss-codex-bbr.conf"
+LOCK_FILE="/var/lock/sscodex.lock"
+LOCK_DIR="/tmp/sscodex.lock"
 SERVICE_NAME="sing-box"
 METHOD="2022-blake3-aes-128-gcm"
 PORT_MIN=10000
@@ -28,6 +30,24 @@ need_root() {
         err "请使用 root 用户运行。"
         exit 1
     fi
+}
+
+acquire_lock() {
+    if command -v flock >/dev/null 2>&1; then
+        mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
+        exec 200>"$LOCK_FILE"
+        if ! flock -n 200; then
+            err "检测到另一个 sscodex 正在运行，请先退出旧菜单。"
+            exit 1
+        fi
+        return 0
+    fi
+
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        err "检测到另一个 sscodex 正在运行，请先退出旧菜单。"
+        exit 1
+    fi
+    trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
 }
 
 detect_os() {
@@ -273,6 +293,10 @@ service_status_short() {
     else
         echo "未知"
     fi
+}
+
+service_is_running() {
+    [ "$(service_status_short)" = "运行中" ]
 }
 
 show_service_status() {
@@ -620,6 +644,69 @@ write_uri_file() {
     chmod 600 "$URI_FILE" 2>/dev/null || true
 }
 
+backup_node_files() {
+    local backup_dir="$1"
+    mkdir -p "$backup_dir"
+
+    [ -f "$CONFIG_PATH" ] && cp -a "$CONFIG_PATH" "$backup_dir/config.json"
+    [ -f "$STATE_FILE" ] && cp -a "$STATE_FILE" "$backup_dir/ss-codex.env"
+    [ -f "$URI_FILE" ] && cp -a "$URI_FILE" "$backup_dir/ss-codex-uri.txt"
+    [ -f /etc/systemd/system/sing-box.service ] && cp -a /etc/systemd/system/sing-box.service "$backup_dir/sing-box.service"
+    [ -f /etc/init.d/sing-box ] && cp -a /etc/init.d/sing-box "$backup_dir/openrc-sing-box"
+
+    if service_is_running; then
+        echo "1" > "$backup_dir/service-running"
+    else
+        echo "0" > "$backup_dir/service-running"
+    fi
+}
+
+restore_node_files() {
+    local backup_dir="$1"
+    local was_running="0"
+
+    [ -f "$backup_dir/service-running" ] && was_running="$(cat "$backup_dir/service-running")"
+
+    warn "创建失败，正在恢复旧配置..."
+    service_stop 2>/dev/null || true
+
+    rm -f "$CONFIG_PATH" "$STATE_FILE" "$URI_FILE"
+    [ -f "$backup_dir/config.json" ] && cp -a "$backup_dir/config.json" "$CONFIG_PATH"
+    [ -f "$backup_dir/ss-codex.env" ] && cp -a "$backup_dir/ss-codex.env" "$STATE_FILE"
+    [ -f "$backup_dir/ss-codex-uri.txt" ] && cp -a "$backup_dir/ss-codex-uri.txt" "$URI_FILE"
+
+    if is_systemd; then
+        if [ -f "$backup_dir/sing-box.service" ]; then
+            cp -a "$backup_dir/sing-box.service" /etc/systemd/system/sing-box.service
+        else
+            rm -f /etc/systemd/system/sing-box.service
+        fi
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+
+    if [ "$OS" = "alpine" ]; then
+        if [ -f "$backup_dir/openrc-sing-box" ]; then
+            cp -a "$backup_dir/openrc-sing-box" /etc/init.d/sing-box
+        else
+            rm -f /etc/init.d/sing-box
+        fi
+    fi
+
+    if [ "$was_running" = "1" ] && [ -f "$CONFIG_PATH" ] && singbox_installed; then
+        service_restart 2>/dev/null || true
+        info "旧配置已恢复，sing-box 已尝试重启。"
+    else
+        info "已恢复到创建前状态。"
+    fi
+
+    rm -rf "$backup_dir"
+}
+
+cleanup_node_backup() {
+    local backup_dir="$1"
+    rm -rf "$backup_dir"
+}
+
 port_in_use() {
     local port="$1"
     ss -tuln 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${port}$"
@@ -740,10 +827,14 @@ EOF
 }
 
 create_or_rebuild_node() {
+    local backup_dir
+    backup_dir="$(mktemp -d /tmp/sscodex-node-backup.XXXXXX)"
+    backup_node_files "$backup_dir"
+
     if node_exists; then
         warn "检测到已有节点。"
         read -r -p "是否覆盖重建？(y/N): " confirm
-        [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消。"; return 0; }
+        [[ "$confirm" =~ ^[Yy]$ ]] || { cleanup_node_backup "$backup_dir"; info "已取消。"; return 0; }
     fi
 
     install_singbox_if_missing
@@ -783,14 +874,37 @@ create_or_rebuild_node() {
 
     info "加密方式：$METHOD"
     info "正在写入配置..."
-    write_config "$port" "$password"
+    if ! write_config "$port" "$password"; then
+        restore_node_files "$backup_dir"
+        err "配置检查失败，未创建新节点。"
+        return 1
+    fi
 
-    save_state "$domain" "$name" "$port" "$password"
-    write_uri_file
+    if ! save_state "$domain" "$name" "$port" "$password"; then
+        restore_node_files "$backup_dir"
+        err "状态文件写入失败，未创建新节点。"
+        return 1
+    fi
 
-    setup_service
+    if ! write_uri_file; then
+        restore_node_files "$backup_dir"
+        err "节点链接写入失败，未创建新节点。"
+        return 1
+    fi
+
+    if ! setup_service; then
+        restore_node_files "$backup_dir"
+        err "服务配置失败，未创建新节点。"
+        return 1
+    fi
     info "正在启动 sing-box 服务..."
-    service_restart
+    if ! service_restart; then
+        restore_node_files "$backup_dir"
+        err "sing-box 启动失败，未创建新节点。"
+        return 1
+    fi
+
+    cleanup_node_backup "$backup_dir"
 
     info "创建完成。可在主菜单选择 2 查看节点链接。"
 }
@@ -1064,6 +1178,131 @@ EOF
     info "SSH 防护：$(fail2ban_sshd_state)"
 }
 
+check_ok() {
+    printf '[OK]   %-18s %s\n' "$1" "${2:-}"
+}
+
+check_warn() {
+    printf '[WARN] %-18s %s\n' "$1" "${2:-}"
+}
+
+check_fail() {
+    printf '[FAIL] %-18s %s\n' "$1" "${2:-}"
+}
+
+public_ipv4() {
+    command -v curl >/dev/null 2>&1 || return 1
+    curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null
+}
+
+resolve_host_ips() {
+    local host="$1"
+
+    command -v getent >/dev/null 2>&1 || return 1
+    getent ahosts "$host" 2>/dev/null | awk '{print $1}' | sort -u | head -n 5
+}
+
+run_self_check() {
+    detect_os
+    local has_node="0"
+
+    cat <<EOF
+========================================
+ 一键自检
+========================================
+EOF
+
+    [ "$(id -u)" = "0" ] && check_ok "运行用户" "root" || check_fail "运行用户" "不是 root"
+
+    if [ -x "$CMD_PATH" ]; then
+        check_ok "sscodex 命令" "$CMD_PATH"
+    else
+        check_warn "sscodex 命令" "未安装到 $CMD_PATH"
+    fi
+
+    if singbox_installed; then
+        check_ok "sing-box" "$(singbox_version)"
+    else
+        check_warn "sing-box" "未安装"
+    fi
+
+    if node_exists; then
+        load_state
+        has_node="1"
+        check_ok "当前节点" "${DOMAIN:-未知}:${PORT:-未知}"
+    else
+        check_warn "当前节点" "未创建"
+    fi
+
+    if [ -f "$CONFIG_PATH" ]; then
+        if singbox_installed && sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
+            check_ok "配置语法" "通过"
+        elif singbox_installed; then
+            check_fail "配置语法" "未通过"
+        else
+            check_warn "配置语法" "sing-box 未安装，无法检查"
+        fi
+    else
+        check_warn "配置文件" "不存在"
+    fi
+
+    check_ok "服务状态" "$(service_status_short)"
+
+    if [ "$has_node" = "1" ] && [ -n "${PORT:-}" ]; then
+        if port_in_use "$PORT"; then
+            check_ok "端口监听" "$PORT 正在监听"
+        else
+            check_warn "端口监听" "$PORT 未监听"
+        fi
+    fi
+
+    if [ "$has_node" = "1" ] && [ -n "${DOMAIN:-}" ]; then
+        if is_ip_address "$DOMAIN"; then
+            check_ok "节点地址" "$DOMAIN"
+        elif is_valid_node_host "$DOMAIN"; then
+            local ips
+            ips="$(resolve_host_ips "$DOMAIN" | tr '\n' ' ')"
+            if [ -n "$ips" ]; then
+                check_ok "域名解析" "$ips"
+            else
+                check_warn "域名解析" "未解析到 IP"
+            fi
+        else
+            check_fail "节点地址" "格式不正确：$DOMAIN"
+        fi
+    fi
+
+    if [ -f "$URI_FILE" ]; then
+        check_ok "节点链接" "$URI_FILE"
+    else
+        check_warn "节点链接" "未生成"
+    fi
+
+    local ip
+    ip="$(public_ipv4 || true)"
+    if [ -n "$ip" ]; then
+        check_ok "公网 IPv4" "$ip"
+    else
+        check_warn "公网 IPv4" "获取失败"
+    fi
+
+    check_ok "BBR" "$(bbr_state)"
+    check_ok "fq" "$(fq_state)"
+    check_ok "Fail2ban" "$(fail2ban_install_state)"
+    check_ok "Fail2ban 状态" "$(fail2ban_service_state)"
+    check_ok "SSH 防护" "$(fail2ban_sshd_state)"
+
+    if [ -f /var/run/reboot-required ]; then
+        check_warn "系统重启" "需要重启"
+    else
+        check_ok "系统重启" "不需要重启"
+    fi
+
+    cat <<EOF
+========================================
+EOF
+}
+
 uninstall_all() {
     echo "此操作会卸载 SS Codex、sing-box，并删除所有节点配置。"
     read -r -p "确认继续？请输入 YES：" confirm
@@ -1169,7 +1408,8 @@ $(ipv4_dns_lines)
 11) 更新 sing-box
 12) 更新 sscodex 脚本
 13) 卸载 SS Codex
-14) 查看端口与安全组建议
+14) 一键自检
+15) 查看端口与安全组建议
  0) 退出
 ========================================
 EOF
@@ -1195,7 +1435,8 @@ main_loop() {
             11) update_singbox; pause ;;
             12) update_sscodex; pause ;;
             13) uninstall_all; pause ;;
-            14) show_ports_security_group; pause ;;
+            14) run_self_check; pause ;;
+            15) show_ports_security_group; pause ;;
             0) exit 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
@@ -1204,5 +1445,6 @@ main_loop() {
 
 need_root
 detect_os
+acquire_lock
 install_self_command
 main_loop
