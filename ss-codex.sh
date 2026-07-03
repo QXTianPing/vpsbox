@@ -1304,11 +1304,13 @@ EOF
     check_ok "Fail2ban 状态" "$(fail2ban_service_state)"
     check_ok "SSH 防护" "$(fail2ban_sshd_state)"
 
-    if [ -f /var/run/reboot-required ]; then
+    if [ "$(reboot_required_state)" = "需要" ]; then
         check_warn "系统重启" "需要重启"
     else
         check_ok "系统重启" "不需要重启"
     fi
+    check_ok "日志占用" "$(journal_disk_usage)"
+    check_ok "日志限制" "$(journald_limit_state)"
 
     cat <<EOF
 ========================================
@@ -1534,6 +1536,127 @@ node_state() {
     node_exists && echo "已创建" || echo "未创建"
 }
 
+node_address() {
+    if ! node_exists; then
+        echo "-"
+        return
+    fi
+
+    load_state
+    if [ -n "${DOMAIN:-}" ] && [ -n "${PORT:-}" ]; then
+        echo "${DOMAIN}:${PORT}"
+    else
+        echo "-"
+    fi
+}
+
+reboot_required_state() {
+    if [ -f /var/run/reboot-required ] || [ -f /run/reboot-required ]; then
+        echo "需要"
+    else
+        echo "不需要"
+    fi
+}
+
+journal_disk_usage() {
+    if command -v journalctl >/dev/null 2>&1; then
+        journalctl --disk-usage 2>/dev/null | sed -E 's/^Archived and active journals take up //; s/\.$//'
+    else
+        echo "无法检测"
+    fi
+}
+
+journald_conf_value() {
+    local key="$1"
+    local file="/etc/systemd/journald.conf"
+    local value
+
+    [ -r "$file" ] || return 1
+    value="$(grep -E "^[[:space:]]*$key=" "$file" 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
+    [ -n "$value" ] || return 1
+    printf '%s\n' "$value"
+}
+
+journald_limit_state() {
+    local max_use
+    local max_file
+
+    max_use="$(journald_conf_value SystemMaxUse || true)"
+    max_file="$(journald_conf_value SystemMaxFileSize || true)"
+
+    if [ "$max_use" = "500M" ] && [ "$max_file" = "50M" ]; then
+        echo "已配置"
+    else
+        echo "未配置"
+    fi
+}
+
+set_journald_conf_value() {
+    local key="$1"
+    local value="$2"
+    local file="/etc/systemd/journald.conf"
+
+    touch "$file"
+    if grep -qE "^[[:space:]]*#?[[:space:]]*$key=" "$file"; then
+        sed -i -E "s|^[[:space:]]*#?[[:space:]]*$key=.*|$key=$value|" "$file"
+    else
+        printf '%s=%s\n' "$key" "$value" >> "$file"
+    fi
+}
+
+limit_systemd_journal() {
+    if ! is_systemd; then
+        err "未检测到 systemd，无法配置 systemd-journald。"
+        return 1
+    fi
+
+    if ! command -v journalctl >/dev/null 2>&1; then
+        err "未找到 journalctl，无法清理 systemd 日志。"
+        return 1
+    fi
+
+    info "正在清理 systemd 日志，仅保留最新 500M..."
+    journalctl --vacuum-size=500M
+
+    info "正在设置日志限制：总大小 500M，单文件 50M..."
+    set_journald_conf_value SystemMaxUse 500M
+    set_journald_conf_value SystemMaxFileSize 50M
+
+    systemctl restart systemd-journald
+    info "systemd 日志限制已设置。"
+    info "当前日志占用：$(journal_disk_usage)"
+}
+
+show_system_maintenance_status() {
+    local max_use
+    local max_file
+
+    max_use="$(journald_conf_value SystemMaxUse || echo "未配置")"
+    max_file="$(journald_conf_value SystemMaxFileSize || echo "未配置")"
+
+    cat <<EOF
+========================================
+ 系统维护状态
+========================================
+ 系统时间：$(date '+%Y-%m-%d %H:%M:%S %Z')
+ 运行时间：$(uptime -p 2>/dev/null || echo "无法检测")
+ 系统重启：$(reboot_required_state)
+
+ BBR：$(bbr_state)
+ fq：$(fq_state)
+ Fail2ban：$(fail2ban_service_state)
+ SSH 防护：$(fail2ban_sshd_state)
+
+ systemd 日志占用：$(journal_disk_usage)
+ systemd 日志限制：$(journald_limit_state)
+ 日志最大占用：$max_use
+ 单个日志最大：$max_file
+========================================
+EOF
+
+    show_ports_security_group || true
+}
+
 show_menu() {
     clear 2>/dev/null || true
     cat <<EOF
@@ -1543,14 +1666,17 @@ show_menu() {
  提示：输入 sscodex 打开管理面板
 ----------------------------------------
  sing-box：$(singbox_install_state)
- 状态：$(service_status_short)
- 版本：$(singbox_version)
+ sing-box 状态：$(service_status_short)
+ sing-box 版本：$(singbox_version)
+ 当前节点：$(node_state)
+ 节点地址：$(node_address)
+----------------------------------------
  BBR：$(bbr_state)
  fq：$(fq_state)
- Fail2ban：$(fail2ban_install_state)
- Fail2ban 状态：$(fail2ban_service_state)
- SSH 防护：$(fail2ban_sshd_state)
- 当前节点：$(node_state)
+ Fail2ban：$(fail2ban_service_state)
+ 系统重启：$(reboot_required_state)
+ 日志限制：$(journald_limit_state)
+----------------------------------------
  IPv4 DNS：
 $(ipv4_dns_lines)
 ----------------------------------------
@@ -1563,24 +1689,23 @@ $(ipv4_dns_lines)
  4) 启动 sing-box 服务
  5) 停止 sing-box 服务
  6) 重启 sing-box 服务
- 7) 查看 sing-box 状态
- 8) 查看 sing-box 日志
 ----------------------------------------
  检查工具
- 9) 一键自检
-10) 查看端口与安全组建议
-11) 查看三网回程
+ 7) 一键自检
+ 8) 查看三网回程
+ 9) 查看系统维护状态
 ----------------------------------------
  系统优化
-12) 一键开启 BBR + fq
-13) 安装 Fail2ban
+10) 一键开启 BBR + fq
+11) 安装 Fail2ban
+12) 限制 systemd 日志大小
 ----------------------------------------
  更新维护
-14) 更新 sing-box
-15) 更新 sscodex 脚本
+13) 更新 sing-box
+14) 更新 sscodex 脚本
 ----------------------------------------
  危险操作
-16) 卸载 SS Codex
+15) 卸载 SS Codex
  0) 退出
 ========================================
 EOF
@@ -1599,16 +1724,15 @@ main_loop() {
             4) start_service_action; pause ;;
             5) service_stop && info "sing-box 服务已停止。"; pause ;;
             6) restart_service_action; pause ;;
-            7) show_service_status; pause ;;
-            8) show_logs ;;
-            9) run_self_check; pause ;;
-            10) show_ports_security_group; pause ;;
-            11) show_backtrace_routes; pause ;;
-            12) enable_bbr_fq; pause ;;
-            13) install_fail2ban; pause ;;
-            14) update_singbox; pause ;;
-            15) update_sscodex; pause ;;
-            16) uninstall_all; pause ;;
+            7) run_self_check; pause ;;
+            8) show_backtrace_routes; pause ;;
+            9) show_system_maintenance_status; pause ;;
+            10) enable_bbr_fq; pause ;;
+            11) install_fail2ban; pause ;;
+            12) limit_systemd_journal; pause ;;
+            13) update_singbox; pause ;;
+            14) update_sscodex; pause ;;
+            15) uninstall_all; pause ;;
             0) exit 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
