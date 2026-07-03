@@ -991,7 +991,13 @@ bbr_state() {
 fq_state() {
     local qdisc
     qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "")"
-    [ "$qdisc" = "fq" ] && echo "已启用" || echo "未启用"
+    if [ "$qdisc" = "fq" ]; then
+        echo "已启用"
+    elif [ -n "$qdisc" ]; then
+        echo "未启用（当前：$qdisc）"
+    else
+        echo "未启用"
+    fi
 }
 
 fail2ban_installed() {
@@ -1138,11 +1144,29 @@ EOF
 }
 
 enable_bbr_fq() {
+    local cc_output fq_output
+
     cat > "$BBR_CONF" <<EOF
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
-    sysctl --system
+
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+    modprobe sch_fq >/dev/null 2>&1 || true
+
+    if cc_output="$(sysctl -w net.ipv4.tcp_congestion_control=bbr 2>&1)"; then
+        info "$cc_output"
+    else
+        warn "BBR 未能立即应用：$cc_output"
+    fi
+
+    if fq_output="$(sysctl -w net.core.default_qdisc=fq 2>&1)"; then
+        info "$fq_output"
+    else
+        warn "fq 未能立即应用：$fq_output"
+        warn "如果这是 LXC/OpenVZ/NAT VPS，qdisc 可能由宿主机控制，实例内无法开启 fq。"
+    fi
+
     echo ""
     info "当前 BBR：$(bbr_state)"
     info "当前 fq：$(fq_state)"
