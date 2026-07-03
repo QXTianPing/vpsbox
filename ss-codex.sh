@@ -25,6 +25,7 @@ TRACE_IPS=(
     "101.95.120.109" "210.22.70.3" "183.192.160.3"
     "58.60.188.222" "210.21.196.6" "120.196.165.24"
 )
+TRACE_MAX_JOBS=3
 
 info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
@@ -1426,15 +1427,21 @@ show_backtrace_routes() {
 ========================================
  三网回程检测
 ========================================
-正在并发检测 ${#TRACE_NAMES[@]} 个目标，每个最多 30 秒，请稍等...
+正在分批检测 ${#TRACE_NAMES[@]} 个目标，每批最多 ${TRACE_MAX_JOBS} 个，每个最多 30 秒，请稍等...
 ----------------------------------------
 线路      目标 IP          判断       关键 ASN
 EOF
 
+    local job_count=0
     for i in "${!TRACE_NAMES[@]}"; do
         name="${TRACE_NAMES[$i]}"
         ip="${TRACE_IPS[$i]}"
         check_route_target "$name" "$ip" "$tmp_dir/$i" &
+        job_count=$((job_count + 1))
+        if [ "$job_count" -ge "$TRACE_MAX_JOBS" ]; then
+            wait
+            job_count=0
+        fi
     done
 
     wait
