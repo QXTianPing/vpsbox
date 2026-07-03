@@ -295,6 +295,114 @@ show_logs() {
     fi
 }
 
+is_loopback_listen_addr() {
+    local addr="$1"
+
+    case "$addr" in
+        127.*|::1|localhost|ip6-localhost)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+show_ports_security_group() {
+    if ! command -v ss >/dev/null 2>&1; then
+        err "未找到 ss 命令，无法查看端口。"
+        return 1
+    fi
+
+    local public_file
+    local local_file
+    local suggest_file
+    local proto
+    local state
+    local recvq
+    local sendq
+    local local_addr
+    local peer_addr
+    local proc_info
+    local addr
+    local port
+    local proto_upper
+    local proc_name
+
+    public_file="$(mktemp)"
+    local_file="$(mktemp)"
+    suggest_file="$(mktemp)"
+
+    while read -r proto state recvq sendq local_addr peer_addr proc_info; do
+        case "$state" in
+            LISTEN|UNCONN) ;;
+            *) continue ;;
+        esac
+
+        port="${local_addr##*:}"
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+
+        addr="${local_addr%:*}"
+        addr="${addr#\[}"
+        addr="${addr%\]}"
+
+        proto_upper="${proto^^}"
+        proc_name="-"
+        if [[ "${proc_info:-}" =~ \"([^\"]+)\" ]]; then
+            proc_name="${BASH_REMATCH[1]}"
+        fi
+
+        if is_loopback_listen_addr "$addr"; then
+            printf '%-5s %-8s %s\n' "$proto_upper" "$port" "$proc_name" >> "$local_file"
+        else
+            printf '%-5s %-8s %s\n' "$proto_upper" "$port" "$proc_name" >> "$public_file"
+            printf '%s %s\n' "$proto_upper" "$port" >> "$suggest_file"
+        fi
+    done < <(ss -H -tulpn 2>/dev/null || true)
+
+    cat <<EOF
+========================================
+ 端口与安全组建议
+========================================
+公网监听，需要安全组放行：
+EOF
+    if [ -s "$public_file" ]; then
+        sort -u "$public_file"
+    else
+        echo "无"
+    fi
+
+    cat <<EOF
+
+本机监听，无需安全组放行：
+EOF
+    if [ -s "$local_file" ]; then
+        sort -u "$local_file"
+    else
+        echo "无"
+    fi
+
+    cat <<EOF
+
+建议入站放行：
+EOF
+    if [ -s "$suggest_file" ]; then
+        sort -u -k1,1 -k2,2n "$suggest_file"
+    else
+        echo "无"
+    fi
+
+    cat <<EOF
+ICMP 可选
+
+建议出站：
+ALL
+========================================
+EOF
+
+    rm -f "$public_file" "$local_file" "$suggest_file"
+}
+
 node_exists() {
     [ -f "$STATE_FILE" ] && [ -f "$CONFIG_PATH" ]
 }
@@ -1061,6 +1169,7 @@ $(ipv4_dns_lines)
 11) 更新 sing-box
 12) 更新 sscodex 脚本
 13) 卸载 SS Codex
+14) 查看端口与安全组建议
  0) 退出
 ========================================
 EOF
@@ -1086,6 +1195,7 @@ main_loop() {
             11) update_singbox; pause ;;
             12) update_sscodex; pause ;;
             13) uninstall_all; pause ;;
+            14) show_ports_security_group; pause ;;
             0) exit 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
