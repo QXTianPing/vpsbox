@@ -1100,11 +1100,11 @@ print_ipv4_dns_from_resolv_conf() {
 }
 
 ipv4_dns_lines() {
-    if print_ipv4_dns_from_resolvectl; then
+    if print_ipv4_dns_from_resolv_conf; then
         return 0
     fi
 
-    if print_ipv4_dns_from_resolv_conf; then
+    if print_ipv4_dns_from_resolvectl; then
         return 0
     fi
 
