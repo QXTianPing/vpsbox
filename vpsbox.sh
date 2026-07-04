@@ -1167,6 +1167,12 @@ delete_node() {
 }
 
 update_singbox() {
+    if ! singbox_installed; then
+        warn "当前未安装 sing-box，已取消更新。"
+        info "如需安装 sing-box，请先创建节点或启动服务。"
+        return 0
+    fi
+
     install_deps
     info "正在更新 sing-box..."
     run_singbox_installer || return 1
