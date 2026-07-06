@@ -71,6 +71,7 @@ sing-box 管理
 3) 安装 Fail2ban
 4) 限制 systemd 日志大小
 5) 修改系统 IPv4 DNS
+6) 启用系统 IPv4 优先
 0) 返回主菜单
 ```
 
@@ -92,6 +93,7 @@ sing-box 管理
 - 安装 Fail2ban
 - 限制 systemd 日志大小
 - 修改系统 IPv4 DNS
+- 启用系统 IPv4 优先，IPv4 不可用时 IPv6 仍可兜底
 - 更新 sing-box
 - 更新 vpsbox 脚本
 - 打开管理面板时自动检查并更新 vpsbox

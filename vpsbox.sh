@@ -10,6 +10,7 @@ CONFIG_PATH="$CONFIG_DIR/config.json"
 STATE_FILE="$CONFIG_DIR/vpsbox.env"
 URI_FILE="$CONFIG_DIR/vpsbox-uri.txt"
 BBR_CONF="/etc/sysctl.d/99-vpsbox-bbr.conf"
+GAI_CONF="/etc/gai.conf"
 RUNTIME_DIR="/run/vpsbox"
 LOCK_FILE="$RUNTIME_DIR/vpsbox.lock"
 LOCK_DIR="$RUNTIME_DIR/lockdir"
@@ -1217,6 +1218,15 @@ fq_state() {
     fi
 }
 
+ipv4_priority_state() {
+    if [ -f "$GAI_CONF" ] &&
+        grep -Eq '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100([[:space:]]|$)' "$GAI_CONF"; then
+        echo "已启用"
+    else
+        echo "未启用"
+    fi
+}
+
 fail2ban_installed() {
     command -v fail2ban-client >/dev/null 2>&1
 }
@@ -1539,6 +1549,40 @@ EOF
     ipv4_dns_lines
 }
 
+enable_ipv4_priority() {
+    local backup=""
+
+    info "正在启用系统 IPv4 优先，不会禁用 IPv6。"
+
+    if [ -s "$GAI_CONF" ]; then
+        backup="${GAI_CONF}.bak.$(date +%F-%H%M%S)"
+        if ! cp -a "$GAI_CONF" "$backup"; then
+            err "备份 $GAI_CONF 失败，已取消修改。"
+            return 1
+        fi
+    fi
+
+    if ! touch "$GAI_CONF"; then
+        err "无法创建或写入 $GAI_CONF。"
+        return 1
+    fi
+
+    if ! sed -i '/^[#[:space:]]*precedence[[:space:]]\+::ffff:0:0\/96[[:space:]]\+/d' "$GAI_CONF"; then
+        err "清理旧 IPv4 优先配置失败。"
+        return 1
+    fi
+
+    if ! printf '%s\n' 'precedence ::ffff:0:0/96 100' >> "$GAI_CONF"; then
+        err "写入 IPv4 优先配置失败。"
+        return 1
+    fi
+
+    info "已写入：precedence ::ffff:0:0/96 100"
+    [ -n "$backup" ] && info "原配置备份：$backup"
+    info "当前 IPv4 优先：$(ipv4_priority_state)"
+    info "可用 curl ip.sb 或 curl -v ip.sb 验证默认出口。"
+}
+
 update_system_packages() {
     detect_os
     if [ "$OS" != "debian" ]; then
@@ -1799,6 +1843,7 @@ EOF
     check_ok "运行时间" "$(uptime -p 2>/dev/null || echo "无法检测")"
     check_ok "BBR" "$(bbr_state)"
     check_ok "fq" "$(fq_state)"
+    check_ok "IPv4 优先" "$(ipv4_priority_state)"
     check_ok "Fail2ban" "$(fail2ban_install_state)"
     check_ok "Fail2ban 状态" "$(fail2ban_service_state)"
     check_ok "SSH 防护" "$(fail2ban_sshd_state)"
@@ -2276,6 +2321,7 @@ system_menu() {
 ========================================
  BBR：$(bbr_state)
  fq：$(fq_state)
+ IPv4 优先：$(ipv4_priority_state)
  Fail2ban：$(fail2ban_service_state)
  SSH 防护：$(fail2ban_sshd_state)
  系统重启：$(reboot_required_state)
@@ -2285,6 +2331,7 @@ system_menu() {
  3) 安装 Fail2ban
  4) 限制 systemd 日志大小
  5) 修改系统 IPv4 DNS
+ 6) 启用系统 IPv4 优先
  0) 返回主菜单
 ========================================
 EOF
@@ -2297,6 +2344,7 @@ EOF
             3) install_fail2ban; pause ;;
             4) limit_systemd_journal; pause ;;
             5) change_ipv4_dns; pause ;;
+            6) enable_ipv4_priority; pause ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
