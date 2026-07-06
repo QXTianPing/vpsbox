@@ -1736,8 +1736,39 @@ check_table_footer() {
 EOF
 }
 
+display_width() {
+    local text="$1"
+    local i ch width=0
+
+    for ((i = 0; i < ${#text}; i++)); do
+        ch="${text:i:1}"
+        case "$ch" in
+            [[:ascii:]]) width=$((width + 1)) ;;
+            *) width=$((width + 2)) ;;
+        esac
+    done
+
+    printf '%s' "$width"
+}
+
+pad_right_display() {
+    local text="$1"
+    local target_width="$2"
+    local width
+    local padding
+
+    width="$(display_width "$text")"
+    padding=$((target_width - width))
+    [ "$padding" -lt 0 ] && padding=0
+
+    printf '%s' "$text"
+    printf '%*s' "$padding" ''
+}
+
 check_row() {
-    printf ' %-6s | %-16s | %s\n' "$1" "$2" "${3:-}"
+    printf ' %-6s | ' "$1"
+    pad_right_display "$2" 16
+    printf ' | %s\n' "${3:-}"
 }
 
 check_ok() {
