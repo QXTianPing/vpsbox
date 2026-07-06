@@ -2088,7 +2088,7 @@ apply_ssh_basic_hardening() {
     info "SSH 基础加固已应用。"
     [ -n "$main_backup" ] && info "主配置备份：$main_backup"
     [ -n "$dropin_backup" ] && info "vpsbox SSH 加固配置备份：$dropin_backup"
-    warn "不要关闭当前 SSH 窗口。建议另开一个新窗口测试 SSH 登录。"
+    warn "当前 SSH 连接通常不会断开，建议另开一个新窗口测试 SSH 登录。"
 }
 
 show_current_ssh_config() {
