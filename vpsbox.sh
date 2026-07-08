@@ -11,6 +11,8 @@ STATE_FILE="$CONFIG_DIR/vpsbox.env"
 URI_FILE="$CONFIG_DIR/vpsbox-uri.txt"
 BBR_CONF="/etc/sysctl.d/99-vpsbox-bbr.conf"
 GAI_CONF="/etc/gai.conf"
+NTP_SOURCES_BEGIN="# BEGIN VPSBOX NTP SOURCES"
+NTP_SOURCES_END="# END VPSBOX NTP SOURCES"
 SSHD_MAIN_CONF="/etc/ssh/sshd_config"
 SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
 SSHD_VPSBOX_PORT_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh-port.conf"
@@ -1403,6 +1405,200 @@ fail2ban_sshd_state() {
     fi
 }
 
+chrony_service_name() {
+    if is_systemd && systemctl list-unit-files chronyd.service 2>/dev/null | grep -q '^chronyd\.service'; then
+        echo "chronyd"
+    else
+        echo "chrony"
+    fi
+}
+
+chrony_conf_path() {
+    detect_os
+    case "$OS" in
+        redhat) echo "/etc/chrony.conf" ;;
+        *) echo "/etc/chrony/chrony.conf" ;;
+    esac
+}
+
+ntp_sync_state() {
+    local svc
+
+    if ! is_systemd; then
+        echo "不支持"
+        return
+    fi
+
+    svc="$(chrony_service_name)"
+    if ! command -v chronyc >/dev/null 2>&1 &&
+        ! systemctl list-unit-files "${svc}.service" 2>/dev/null | grep -q "^${svc}\\.service"; then
+        echo "未安装"
+        return
+    fi
+
+    if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+        echo "未运行"
+        return
+    fi
+
+    if command -v chronyc >/dev/null 2>&1 &&
+        chronyc tracking 2>/dev/null | grep -Eq '^Leap status[[:space:]]*:[[:space:]]*Normal'; then
+        echo "已同步"
+    else
+        echo "运行中"
+    fi
+}
+
+remove_vpsbox_ntp_block() {
+    local file="$1"
+
+    [ -f "$file" ] || return 0
+    sed -i "/^# BEGIN VPSBOX NTP SOURCES$/,/^# END VPSBOX NTP SOURCES$/d" "$file"
+}
+
+write_chrony_sources() {
+    local conf
+    local source_file="/etc/chrony/sources.d/vpsbox.sources"
+
+    conf="$(chrony_conf_path)"
+    if [ ! -f "$conf" ]; then
+        err "未找到 chrony 配置文件：$conf"
+        return 1
+    fi
+
+    if grep -Eq '^[[:space:]]*sourcedir[[:space:]]+/etc/chrony/sources\.d([[:space:]]|$)' "$conf"; then
+        mkdir -p /etc/chrony/sources.d
+        cat > "$source_file" <<EOF
+pool time.cloudflare.com iburst maxsources 4
+pool pool.ntp.org iburst maxsources 4
+EOF
+        remove_vpsbox_ntp_block "$conf"
+        info "已写入 NTP 源：$source_file"
+    else
+        remove_vpsbox_ntp_block "$conf"
+        cat >> "$conf" <<EOF
+
+$NTP_SOURCES_BEGIN
+pool time.cloudflare.com iburst maxsources 4
+pool pool.ntp.org iburst maxsources 4
+$NTP_SOURCES_END
+EOF
+        rm -f "$source_file" 2>/dev/null || true
+        info "已写入 NTP 源：$conf"
+    fi
+}
+
+show_chrony_permission_hint() {
+    local svc="$1"
+    local logs
+
+    logs="$(journalctl -u "$svc" -n 30 --no-pager 2>/dev/null || true)"
+    if echo "$logs" | grep -Eqi 'adjtimex|Operation not permitted'; then
+        warn "检测到 chrony 无权限调整系统时间。"
+        warn "当前可能是 LXC/OpenVZ 容器 VPS，实例内无法自行校时，请依赖宿主机 NTP 或联系服务商。"
+    else
+        warn "chrony 未正常启动，可执行以下命令查看原因："
+        warn "journalctl -u $svc -n 50 --no-pager"
+    fi
+}
+
+enable_ntp_sync() {
+    local svc
+    local active_state
+    local enabled_state
+    local tracking_output
+
+    detect_os
+    if ! is_systemd; then
+        err "未检测到 systemd，无法自动配置 chrony。"
+        return 1
+    fi
+
+    info "正在安装 chrony..."
+    case "$OS" in
+        debian)
+            export DEBIAN_FRONTEND=noninteractive
+            retry 3 2 apt-get update -y || return 1
+            if ! retry 3 2 apt-get install -y chrony; then
+                show_chrony_permission_hint "$(chrony_service_name)"
+                return 1
+            fi
+            ;;
+        redhat)
+            if command -v dnf >/dev/null 2>&1; then
+                if ! retry 3 2 dnf install -y chrony; then
+                    show_chrony_permission_hint "$(chrony_service_name)"
+                    return 1
+                fi
+            else
+                if ! retry 3 2 yum install -y chrony; then
+                    show_chrony_permission_hint "$(chrony_service_name)"
+                    return 1
+                fi
+            fi
+            ;;
+        alpine)
+            err "Alpine 暂不支持自动配置 chrony，请手动使用 apk/rc-service 配置。"
+            return 1
+            ;;
+        *)
+            err "未识别系统类型，无法自动配置 chrony。"
+            return 1
+            ;;
+    esac
+
+    svc="$(chrony_service_name)"
+    info "chrony 服务名：$svc"
+
+    if systemctl list-unit-files systemd-timesyncd.service 2>/dev/null | grep -q '^systemd-timesyncd\.service'; then
+        info "正在停用 systemd-timesyncd，避免多个 NTP 客户端并存..."
+        systemctl disable --now systemd-timesyncd 2>/dev/null || true
+    fi
+
+    systemctl stop "$svc" 2>/dev/null || true
+    write_chrony_sources || return 1
+
+    info "正在启用 chrony 并设置开机自启..."
+    if ! systemctl enable --now "$svc"; then
+        show_chrony_permission_hint "$svc"
+        return 1
+    fi
+
+    sleep 2
+    if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+        show_chrony_permission_hint "$svc"
+        return 1
+    fi
+
+    enabled_state="$(systemctl is-enabled "$svc" 2>/dev/null || echo "unknown")"
+    active_state="$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")"
+    info "chrony 开机自启：$enabled_state"
+    info "chrony 运行状态：$active_state"
+
+    echo ""
+    info "NTP 时间源："
+    chronyc sources -v 2>/dev/null || warn "无法读取 chrony 时间源。"
+
+    echo ""
+    info "同步状态："
+    tracking_output="$(chronyc tracking 2>/dev/null || true)"
+    if [ -n "$tracking_output" ]; then
+        printf '%s\n' "$tracking_output"
+        if echo "$tracking_output" | grep -Eq '^Leap status[[:space:]]*:[[:space:]]*Normal'; then
+            info "NTP 时间同步已启用。"
+        else
+            warn "chrony 已运行，首次同步可能需要几分钟。"
+        fi
+    else
+        warn "无法读取 chrony 同步状态。"
+    fi
+
+    echo ""
+    info "系统时间关键状态："
+    timedatectl show -p Timezone -p NTP -p NTPSynchronized -p TimeUSec 2>/dev/null || true
+    warn "如确认需要立即校准，可手动执行：chronyc makestep"
+}
+
 print_ipv4_dns_from_resolvectl() {
     command -v resolvectl >/dev/null 2>&1 || return 1
 
@@ -2551,6 +2747,7 @@ EOF
     fi
 
     check_ok "系统时间" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+    check_ok "NTP 同步" "$(ntp_sync_state)"
     check_ok "运行时间" "$(uptime -p 2>/dev/null || echo "无法检测")"
     check_ok "BBR" "$(bbr_state)"
     check_ok "fq" "$(fq_state)"
@@ -3045,6 +3242,7 @@ system_menu() {
  SSH 加固：$(ssh_hardening_state)
  Fail2ban：$(fail2ban_service_state)
  SSH 防护：$(fail2ban_sshd_state)
+ NTP 同步：$(ntp_sync_state)
  系统重启：$(reboot_required_state)
 ----------------------------------------
  1) 系统更新
@@ -3056,6 +3254,7 @@ system_menu() {
  7) 修改 SSH 端口
  8) SSH 基础加固
  9) 查看 SSH 当前生效配置
+ 10) 开启 NTP 时间同步
  0) 返回主菜单
 ========================================
 EOF
@@ -3072,6 +3271,7 @@ EOF
             7) ssh_port_change_menu ;;
             8) ssh_basic_hardening_menu ;;
             9) show_current_ssh_config; pause ;;
+            10) enable_ntp_sync; pause ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac

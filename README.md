@@ -75,6 +75,7 @@ sing-box 管理
 7) 修改 SSH 端口
 8) SSH 基础加固
 9) 查看 SSH 当前生效配置
+10) 开启 NTP 时间同步
 0) 返回主菜单
 ```
 
@@ -94,6 +95,7 @@ sing-box 管理
 - 系统更新
 - 一键开启 BBR + fq
 - 安装 Fail2ban
+- 开启 NTP 时间同步，使用 chrony 自动校准系统时间并设置开机自启
 - 限制 systemd 日志大小
 - 修改系统 IPv4 DNS
 - 启用系统 IPv4 优先，IPv4 不可用时 IPv6 仍可兜底
