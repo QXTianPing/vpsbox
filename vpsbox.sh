@@ -1507,6 +1507,7 @@ enable_ntp_sync() {
     local svc
     local active_state
     local enabled_state
+    local sources_output
     local tracking_output
 
     detect_os
@@ -1578,7 +1579,15 @@ enable_ntp_sync() {
 
     echo ""
     info "NTP 时间源："
-    chronyc sources -v 2>/dev/null || warn "无法读取 chrony 时间源。"
+    if ! sources_output="$(chronyc sources -v 2>/dev/null)"; then
+        sleep 1
+        sources_output="$(chronyc sources -v 2>/dev/null || true)"
+    fi
+    if [ -n "$sources_output" ]; then
+        printf '%s\n' "$sources_output"
+    else
+        warn "无法读取 chrony 时间源。"
+    fi
 
     echo ""
     info "同步状态："
