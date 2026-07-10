@@ -5,7 +5,8 @@ umask 077
 APP_NAME="VPSBox"
 VPSBOX_VERSION="v1.0.0"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
-SINGBOX_INSTALL_URL="https://sing-box.app/install.sh"
+SINGBOX_RELEASE_VERSION="1.13.14"
+NEXTTRACE_RELEASE_VERSION="1.7.1"
 CMD_PATH="/usr/local/bin/vpsbox"
 CONFIG_DIR="/etc/sing-box"
 CONFIG_PATH="$CONFIG_DIR/config.json"
@@ -31,6 +32,7 @@ FAIL2BAN_VPSBOX_SSHD_CONF="$FAIL2BAN_CONFIG_DIR/99-vpsbox-sshd.local"
 RUNTIME_DIR="/run/vpsbox"
 LOCK_FILE="$RUNTIME_DIR/vpsbox.lock"
 LOCK_DIR="$RUNTIME_DIR/lockdir"
+LOCK_USING_DIR=0
 SERVICE_NAME="sing-box"
 METHOD="2022-blake3-aes-128-gcm"
 PORT_MIN=10000
@@ -81,7 +83,18 @@ retry() {
 
 pause() {
     echo ""
-    read -r -p "按回车返回主菜单..." _
+    read -r -p "按回车返回主菜单..." _ || exit 0
+}
+
+run_menu_action() {
+    local status
+    if "$@"; then
+        return 0
+    else
+        status=$?
+    fi
+    warn "操作未完成（退出码：$status），已保留当前菜单。"
+    return 0
 }
 
 need_root() {
@@ -114,6 +127,68 @@ process_alive() {
     local pid="$1"
 
     is_pid "$pid" && kill -0 "$pid" 2>/dev/null
+}
+
+lock_metadata_value() {
+    local path="$1" key="$2"
+    [ -f "$path" ] || return 1
+    awk -F= -v key="$key" '$1 == key { print $2; exit }' "$path" 2>/dev/null
+}
+
+process_start_ticks() {
+    local pid="$1" stat
+    stat="$(cat "/proc/$pid/stat" 2>/dev/null)" || return 1
+    stat="${stat##*) }"
+    printf '%s\n' "$stat" | awk '{print $20}'
+}
+
+process_stdin_tty() {
+    local pid="$1" tty
+    tty="$(readlink "/proc/$pid/fd/0" 2>/dev/null || true)"
+    case "$tty" in
+        /dev/pts/*|/dev/tty*) [ -c "$tty" ] && printf '%s\n' "$tty" ;;
+    esac
+}
+
+lock_owner_matches() {
+    local path="$1" pid="$2" recorded_start recorded_boot current_start current_boot
+    process_alive "$pid" || return 1
+    recorded_start="$(lock_metadata_value "$path" start_ticks || true)"
+    recorded_boot="$(lock_metadata_value "$path" boot_id || true)"
+    current_start="$(process_start_ticks "$pid" || true)"
+    current_boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+    [ -n "$recorded_start" ] && [ "$recorded_start" = "$current_start" ] &&
+        [ -n "$recorded_boot" ] && [ "$recorded_boot" = "$current_boot" ]
+}
+
+old_menu_lost_terminal() {
+    local path="$1" pid="$2"
+    lock_owner_matches "$path" "$pid" || return 1
+    [ -z "$(process_stdin_tty "$pid")" ]
+}
+
+terminate_orphaned_vpsbox_menu() {
+    local pid="$1" i
+    warn "检测到失去终端的旧 vpsbox 菜单（PID $pid），正在自动回收锁。"
+    kill -TERM "$pid" 2>/dev/null || return 1
+    for i in 1 2 3 4 5; do
+        process_alive "$pid" || return 0
+        sleep 1
+    done
+    kill -KILL "$pid" 2>/dev/null || return 1
+    sleep 1
+    ! process_alive "$pid"
+}
+
+cleanup_vpsbox_lock() {
+    if [ "$LOCK_USING_DIR" = "1" ] && [ -d "$LOCK_DIR" ] && [ ! -L "$LOCK_DIR" ]; then
+        rm -rf "$LOCK_DIR"
+    fi
+}
+
+install_lock_cleanup_traps() {
+    trap cleanup_vpsbox_lock EXIT
+    trap 'exit 0' HUP INT TERM QUIT
 }
 
 lock_pid_from_file() {
@@ -182,6 +257,9 @@ write_flock_metadata() {
     : > "$LOCK_FILE"
     {
         printf 'pid=%s\n' "$$"
+        printf 'start_ticks=%s\n' "$(process_start_ticks "$$" || true)"
+        printf 'boot_id=%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+        printf 'tty=%s\n' "$(process_stdin_tty "$$" || true)"
         printf 'started=%s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
     } >&200
 }
@@ -189,6 +267,9 @@ write_flock_metadata() {
 write_lockdir_metadata() {
     {
         printf 'pid=%s\n' "$$"
+        printf 'start_ticks=%s\n' "$(process_start_ticks "$$" || true)"
+        printf 'boot_id=%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+        printf 'tty=%s\n' "$(process_stdin_tty "$$" || true)"
         printf 'started=%s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
     } > "$LOCK_DIR/pid"
 }
@@ -202,13 +283,22 @@ acquire_lock() {
         exec 200>"$LOCK_FILE"
         if flock -n 200; then
             write_flock_metadata
+            install_lock_cleanup_traps
             return 0
         fi
 
         old_pid="$(lock_pid_from_file "$LOCK_FILE" || true)"
+        if old_menu_lost_terminal "$LOCK_FILE" "$old_pid" && terminate_orphaned_vpsbox_menu "$old_pid"; then
+            if flock -n 200; then
+                write_flock_metadata
+                install_lock_cleanup_traps
+                return 0
+            fi
+        fi
         if terminate_old_vpsbox_menu "$old_pid"; then
             if flock -n 200; then
                 write_flock_metadata
+                install_lock_cleanup_traps
                 return 0
             fi
             err "旧菜单已处理，但锁仍被占用，请稍后重试。"
@@ -221,7 +311,8 @@ acquire_lock() {
 
     if mkdir "$LOCK_DIR" 2>/dev/null; then
         write_lockdir_metadata
-        trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+        LOCK_USING_DIR=1
+        install_lock_cleanup_traps
         return 0
     fi
 
@@ -232,14 +323,24 @@ acquire_lock() {
         rm -rf "$LOCK_DIR"
         if mkdir "$LOCK_DIR" 2>/dev/null; then
             write_lockdir_metadata
-            trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+            LOCK_USING_DIR=1
+            install_lock_cleanup_traps
+            return 0
+        fi
+    elif old_menu_lost_terminal "$LOCK_DIR/pid" "$old_pid" && terminate_orphaned_vpsbox_menu "$old_pid"; then
+        rm -rf "$LOCK_DIR"
+        if mkdir "$LOCK_DIR" 2>/dev/null; then
+            write_lockdir_metadata
+            LOCK_USING_DIR=1
+            install_lock_cleanup_traps
             return 0
         fi
     elif terminate_old_vpsbox_menu "$old_pid"; then
         rm -rf "$LOCK_DIR"
         if mkdir "$LOCK_DIR" 2>/dev/null; then
             write_lockdir_metadata
-            trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+            LOCK_USING_DIR=1
+            install_lock_cleanup_traps
             return 0
         fi
     fi
@@ -249,7 +350,8 @@ acquire_lock() {
         exit 1
     fi
     write_lockdir_metadata
-    trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+    LOCK_USING_DIR=1
+    install_lock_cleanup_traps
 }
 
 detect_os() {
@@ -400,37 +502,72 @@ vpsbox_update_notice() {
     fi
 }
 
-run_singbox_installer() {
-    local tmp
+github_release_asset() {
+    local repo="$1" tag="$2" asset="$3" api url digest
 
     ensure_curl || return 1
-
-    if command -v mktemp >/dev/null 2>&1; then
-        tmp="$(mktemp /tmp/vpsbox-sing-box-install.XXXXXX)"
-    else
-        tmp="/tmp/vpsbox-sing-box-install.$$"
-        : > "$tmp"
-    fi
-
-    if ! retry 3 2 curl -fsSL "$SINGBOX_INSTALL_URL" -o "$tmp"; then
-        rm -f "$tmp"
-        err "sing-box 安装脚本下载失败，请检查网络或官方安装地址。"
+    command -v jq >/dev/null 2>&1 || { err "未找到 jq，无法校验 GitHub Release 资产。"; return 1; }
+    api="https://api.github.com/repos/$repo/releases/tags/$tag"
+    if ! api="$(curl -fsSL --connect-timeout 8 --max-time 30 "$api")"; then
+        err "无法读取 $repo 的 Release 元数据：$tag"
         return 1
     fi
+    url="$(printf '%s' "$api" | jq -r --arg asset "$asset" '.assets[] | select(.name == $asset) | .browser_download_url' | head -n 1)"
+    digest="$(printf '%s' "$api" | jq -r --arg asset "$asset" '.assets[] | select(.name == $asset) | .digest' | head -n 1)"
+    [[ "$url" =~ ^https://github.com/ ]] || { err "未找到 Release 资产：$asset"; return 1; }
+    [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { err "Release 未提供有效 SHA256：$asset"; return 1; }
+    printf '%s\n%s\n' "$url" "$digest"
+}
 
-    if ! bash -n "$tmp"; then
-        rm -f "$tmp"
-        err "sing-box 安装脚本未通过语法检查，已取消执行。"
+download_verified_github_asset() {
+    local repo="$1" tag="$2" asset="$3" dest="$4"
+    local metadata url digest actual
+
+    metadata="$(github_release_asset "$repo" "$tag" "$asset")" || return 1
+    url="$(printf '%s\n' "$metadata" | sed -n '1p')"
+    digest="$(printf '%s\n' "$metadata" | sed -n '2p')"
+    if ! retry 3 2 curl -fL --connect-timeout 8 --max-time 180 "$url" -o "$dest"; then
+        rm -f "$dest"
         return 1
     fi
-
-    if ! bash "$tmp"; then
-        rm -f "$tmp"
-        err "sing-box 安装脚本执行失败。"
+    actual="sha256:$(sha256sum "$dest" | awk '{print $1}')"
+    if [ "$actual" != "$digest" ]; then
+        rm -f "$dest"
+        err "SHA256 校验失败：$asset"
         return 1
     fi
+}
 
-    rm -f "$tmp"
+run_singbox_installer() {
+    local version="${1:-$SINGBOX_RELEASE_VERSION}"
+    local arch suffix asset tmp_dir tmp
+
+    [[ "$version" =~ ^[0-9]+([.][0-9]+){2}$ ]] || { err "sing-box 版本格式无效：$version"; return 1; }
+
+    detect_os
+    case "$OS" in
+        debian) arch="$(dpkg --print-architecture)"; suffix="deb" ;;
+        alpine) arch="$(apk --print-arch)"; suffix="apk" ;;
+        redhat) arch="$(uname -m)"; suffix="rpm" ;;
+        *) err "当前系统不支持 sing-box 固定 Release 安装。"; return 1 ;;
+    esac
+    asset="sing-box_${version}_linux_${arch}.${suffix}"
+    tmp_dir="$(mktemp -d /tmp/vpsbox-sing-box-release.XXXXXX)" || return 1
+    tmp="$tmp_dir/$asset"
+    info "正在下载并校验 sing-box v$version（$asset）..."
+    if ! download_verified_github_asset "SagerNet/sing-box" "v$version" "$asset" "$tmp"; then
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    case "$OS" in
+        debian) dpkg -i "$tmp" || { rm -rf "$tmp_dir"; return 1; } ;;
+        alpine) apk add --allow-untrusted "$tmp" || { rm -rf "$tmp_dir"; return 1; } ;;
+        redhat)
+            if command -v dnf >/dev/null 2>&1; then dnf install -y "$tmp"; else yum install -y "$tmp"; fi || { rm -rf "$tmp_dir"; return 1; }
+            ;;
+    esac
+    rm -rf "$tmp_dir"
+    return 0
 }
 
 install_self_command() {
@@ -601,16 +738,15 @@ install_singbox_if_missing() {
     fi
 
     info "未检测到 sing-box，开始自动安装..."
-    install_deps
+    install_deps || return 1
     detect_os
 
-    # Alpine 不再混用 edge/community；官方安装脚本会按 apk 架构安装对应的稳定版发布包。
-    # Debian/Ubuntu 及其他系统继续沿用原有官方安装流程。
-    run_singbox_installer || exit 1
+    # 使用固定官方 Release 包与 GitHub 提供的 SHA256，不混用 Alpine edge/community。
+    run_singbox_installer || return 1
 
     if ! singbox_installed; then
         err "sing-box 安装失败，请检查网络或手动安装。"
-        exit 1
+        return 1
     fi
 
     info "sing-box 安装完成：$(singbox_version)"
@@ -846,6 +982,13 @@ load_state() {
     local port=""
     local password=""
     local method=""
+    local protocol="shadowsocks"
+    local uuid=""
+    local flow=""
+    local reality_server_name=""
+    local reality_public_key=""
+    local reality_short_id=""
+    local fingerprint=""
 
     state_file_is_secure || return 1
 
@@ -856,6 +999,13 @@ load_state() {
             PORT) port="$value" ;;
             PASSWORD) password="$value" ;;
             METHOD) method="$value" ;;
+            PROTOCOL) protocol="$value" ;;
+            UUID) uuid="$value" ;;
+            FLOW) flow="$value" ;;
+            REALITY_SERVER_NAME) reality_server_name="$value" ;;
+            REALITY_PUBLIC_KEY) reality_public_key="$value" ;;
+            REALITY_SHORT_ID) reality_short_id="$value" ;;
+            FINGERPRINT) fingerprint="$value" ;;
             ""|'#'*) ;;
             *) return 1 ;;
         esac
@@ -864,14 +1014,34 @@ load_state() {
     is_valid_node_host "$domain" || return 1
     [ -n "$name" ] && [ "$(sanitize_name "$name")" = "$name" ] || return 1
     [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
-    [[ "$password" =~ ^[A-Za-z0-9_+/=-]+$ ]] || return 1
-    [ "$method" = "$METHOD" ] || return 1
+    case "$protocol" in
+        shadowsocks)
+            [[ "$password" =~ ^[A-Za-z0-9_+/=-]+$ ]] || return 1
+            [ "$method" = "$METHOD" ] || return 1
+            ;;
+        vless-reality)
+            [[ "$uuid" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] || return 1
+            [ "$flow" = "xtls-rprx-vision" ] || return 1
+            is_domain_name "$reality_server_name" || return 1
+            [[ "$reality_public_key" =~ ^[A-Za-z0-9_-]{40,60}$ ]] || return 1
+            [[ "$reality_short_id" =~ ^[0-9A-Fa-f]{16}$ ]] || return 1
+            [ "$fingerprint" = "chrome" ] || return 1
+            ;;
+        *) return 1 ;;
+    esac
 
     DOMAIN="$domain"
     NAME="$name"
     PORT="$port"
     PASSWORD="$password"
     METHOD="$method"
+    PROTOCOL="$protocol"
+    UUID="$uuid"
+    FLOW="$flow"
+    REALITY_SERVER_NAME="$reality_server_name"
+    REALITY_PUBLIC_KEY="$reality_public_key"
+    REALITY_SHORT_ID="$reality_short_id"
+    FINGERPRINT="$fingerprint"
 }
 
 save_state() {
@@ -882,11 +1052,32 @@ save_state() {
 
     secure_config_dir || return 1
     {
+        printf 'PROTOCOL=shadowsocks\n'
         printf 'DOMAIN=%s\n' "$domain"
         printf 'NAME=%s\n' "$name"
         printf 'PORT=%s\n' "$port"
         printf 'PASSWORD=%s\n' "$password"
         printf 'METHOD=%s\n' "$METHOD"
+    } > "$STATE_FILE"
+    chown root:root "$STATE_FILE" || return 1
+    chmod 600 "$STATE_FILE" || return 1
+}
+
+save_vless_reality_state() {
+    local domain="$1" name="$2" port="$3" uuid="$4" server_name="$5" public_key="$6" short_id="$7"
+
+    secure_config_dir || return 1
+    {
+        printf 'PROTOCOL=vless-reality\n'
+        printf 'DOMAIN=%s\n' "$domain"
+        printf 'NAME=%s\n' "$name"
+        printf 'PORT=%s\n' "$port"
+        printf 'UUID=%s\n' "$uuid"
+        printf 'FLOW=xtls-rprx-vision\n'
+        printf 'REALITY_SERVER_NAME=%s\n' "$server_name"
+        printf 'REALITY_PUBLIC_KEY=%s\n' "$public_key"
+        printf 'REALITY_SHORT_ID=%s\n' "$short_id"
+        printf 'FINGERPRINT=chrome\n'
     } > "$STATE_FILE"
     chown root:root "$STATE_FILE" || return 1
     chmod 600 "$STATE_FILE" || return 1
@@ -1071,8 +1262,16 @@ generate_link() {
     local host
     local encoded
     host="$(uri_host "${DOMAIN:-}")"
-    encoded="$(url_encode_userinfo "${METHOD:-$METHOD}:${PASSWORD:-}")"
-    echo "ss://${encoded}@${host}:${PORT:-0}#${NAME:-ss}"
+    case "${PROTOCOL:-shadowsocks}" in
+        shadowsocks)
+            encoded="$(url_encode_userinfo "${METHOD:-$METHOD}:${PASSWORD:-}")"
+            echo "ss://${encoded}@${host}:${PORT:-0}#${NAME:-ss}"
+            ;;
+        vless-reality)
+            echo "vless://${UUID}@${host}:${PORT}?encryption=none&flow=${FLOW}&security=reality&sni=${REALITY_SERVER_NAME}&fp=${FINGERPRINT}&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SHORT_ID}&type=tcp#${NAME}"
+            ;;
+        *) return 1 ;;
+    esac
 }
 
 write_uri_file() {
@@ -1150,6 +1349,15 @@ port_in_use() {
     ss -tuln 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${port}$"
 }
 
+wait_for_port_listener() {
+    local port="$1" i
+    for i in 1 2 3 4 5; do
+        port_in_use "$port" && return 0
+        sleep 1
+    done
+    return 1
+}
+
 ipv6_listen_available() {
     [ -r /proc/net/if_inet6 ] || return 1
     [ -s /proc/net/if_inet6 ] || return 1
@@ -1192,7 +1400,56 @@ random_port() {
             return 0
         fi
     done
-    echo $((RANDOM % (PORT_MAX - PORT_MIN + 1) + PORT_MIN))
+    err "连续 100 次未找到可用随机端口。"
+    return 1
+}
+
+is_valid_port() {
+    [[ "${1:-}" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+port_is_effective_ssh_port() {
+    local port="$1" ports
+    ports="$(ssh_effective_ports_csv 2>/dev/null || true)"
+    case ",$ports," in
+        *",$port,"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+choose_node_port() {
+    local existing_port="${1:-}" input confirm
+
+    while true; do
+        if [ -n "$existing_port" ]; then
+            printf '请输入节点端口（留空自动随机；当前端口 %s 可保留）: ' "$existing_port" >&2
+        else
+            printf '请输入节点端口（1-65535，留空自动随机）: ' >&2
+        fi
+        read -r input || return 1
+        if [ -z "$input" ]; then
+            random_port
+            return $?
+        fi
+        if ! is_valid_port "$input"; then
+            err "端口必须是 1-65535 的整数。"
+            continue
+        fi
+        if port_is_effective_ssh_port "$input"; then
+            err "端口 $input 是当前 SSH 生效端口，不能用于节点。"
+            continue
+        fi
+        if [ "$input" != "$existing_port" ] && port_in_use "$input"; then
+            err "端口 $input 已被占用，请更换。"
+            continue
+        fi
+        if [ "$input" -lt 1024 ]; then
+            read -r -p "端口 $input 属于特权端口，确认使用？请输入 YES：" confirm
+            [ "$confirm" = "YES" ] || continue
+        fi
+        printf '%s\n' "$input"
+        return 0
+    done
 }
 
 random_password() {
@@ -1286,6 +1543,105 @@ EOF
     sing-box check -c "$CONFIG_PATH" >/dev/null
 }
 
+write_vless_reality_inbound_json() {
+    local tag="$1" listen="$2" port="$3" uuid="$4" server_name="$5" private_key="$6" short_id="$7" suffix="${8:-}"
+
+    cat <<EOF
+    {
+      "type": "vless",
+      "tag": "$tag",
+      "listen": "$listen",
+      "listen_port": $port,
+      "users": [
+        {
+          "name": "vpsbox",
+          "uuid": "$uuid",
+          "flow": "xtls-rprx-vision"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "$server_name",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "$server_name",
+            "server_port": 443
+          },
+          "private_key": "$private_key",
+          "short_id": ["$short_id"]
+        }
+      }
+    }$suffix
+EOF
+}
+
+write_vless_reality_config() {
+    local port="$1" uuid="$2" server_name="$3" private_key="$4" short_id="$5" mode
+
+    secure_config_dir || return 1
+    if [ -f "$CONFIG_PATH" ]; then
+        cp "$CONFIG_PATH" "${CONFIG_PATH}.bak" || return 1
+        chown root:root "${CONFIG_PATH}.bak" || return 1
+        chmod 600 "${CONFIG_PATH}.bak" || return 1
+    fi
+    mode="$(listen_mode)"
+    case "$mode" in
+        ipv6) info "监听地址：::（IPv4/IPv6 双栈）" ;;
+        dual) info "监听地址：0.0.0.0 + ::（系统启用了 IPv6-only 监听）" ;;
+        *) info "监听地址：0.0.0.0" ;;
+    esac
+
+    cat > "$CONFIG_PATH" <<EOF
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [
+EOF
+    case "$mode" in
+        ipv6) write_vless_reality_inbound_json "vpsbox-vless-reality-in" "::" "$port" "$uuid" "$server_name" "$private_key" "$short_id" >> "$CONFIG_PATH" ;;
+        dual)
+            write_vless_reality_inbound_json "vpsbox-vless-reality-in-ipv4" "0.0.0.0" "$port" "$uuid" "$server_name" "$private_key" "$short_id" "," >> "$CONFIG_PATH"
+            write_vless_reality_inbound_json "vpsbox-vless-reality-in-ipv6" "::" "$port" "$uuid" "$server_name" "$private_key" "$short_id" >> "$CONFIG_PATH"
+            ;;
+        *) write_vless_reality_inbound_json "vpsbox-vless-reality-in" "0.0.0.0" "$port" "$uuid" "$server_name" "$private_key" "$short_id" >> "$CONFIG_PATH" ;;
+    esac
+    cat >> "$CONFIG_PATH" <<EOF
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+EOF
+    chown root:root "$CONFIG_PATH" || return 1
+    chmod 600 "$CONFIG_PATH" || return 1
+    sing-box check -c "$CONFIG_PATH" >/dev/null
+}
+
+generate_reality_keypair() {
+    local output private_key public_key
+    output="$(sing-box generate reality-keypair 2>/dev/null)" || return 1
+    private_key="$(printf '%s\n' "$output" | awk -F': *' '/^PrivateKey:/ {print $2; exit}')"
+    public_key="$(printf '%s\n' "$output" | awk -F': *' '/^PublicKey:/ {print $2; exit}')"
+    [[ "$private_key" =~ ^[A-Za-z0-9_-]{40,60}$ ]] || return 1
+    [[ "$public_key" =~ ^[A-Za-z0-9_-]{40,60}$ ]] || return 1
+    printf '%s\n%s\n' "$private_key" "$public_key"
+}
+
+check_reality_server() {
+    local server_name="$1"
+    is_domain_name "$server_name" || return 1
+    resolve_host_ips "$server_name" | grep -q . || return 1
+    if command -v openssl >/dev/null 2>&1; then
+        timeout 12 openssl s_client -connect "${server_name}:443" -servername "$server_name" </dev/null >/dev/null 2>&1 || return 1
+    fi
+}
+
 setup_service() {
     local bin
     bin="$(command -v sing-box)"
@@ -1347,16 +1703,22 @@ EOF
 
 create_or_rebuild_node() {
     local backup_dir
+    local existing_port=""
     backup_dir="$(mktemp -d /tmp/vpsbox-node-backup.XXXXXX)"
     backup_node_files "$backup_dir"
 
     if node_exists; then
+        existing_port="$PORT"
         warn "检测到已有节点。"
         read -r -p "是否覆盖重建？(y/N): " confirm
         [[ "$confirm" =~ ^[Yy]$ ]] || { cleanup_node_backup "$backup_dir"; info "已取消。"; return 0; }
     fi
 
-    install_singbox_if_missing
+    if ! install_singbox_if_missing; then
+        cleanup_node_backup "$backup_dir"
+        err "sing-box 安装失败，未创建新节点。"
+        return 1
+    fi
 
     local input_host
     local domain
@@ -1384,9 +1746,12 @@ create_or_rebuild_node() {
     read -r -p "请输入节点名称，留空默认 ${default_name}：" input_name
     name="$(sanitize_name "${input_name:-$default_name}")"
 
-    info "正在自动选择端口..."
-    port="$(random_port)"
-    info "自动选择端口：$port"
+    if ! port="$(choose_node_port "$existing_port")"; then
+        cleanup_node_backup "$backup_dir"
+        err "节点端口选择失败，未创建新节点。"
+        return 1
+    fi
+    info "节点端口：$port"
 
     info "正在自动生成随机强密码..."
     password="$(random_password)"
@@ -1422,9 +1787,120 @@ create_or_rebuild_node() {
         err "sing-box 启动失败，未创建新节点。"
         return 1
     fi
+    if ! service_is_running || ! wait_for_port_listener "$port"; then
+        restore_node_files "$backup_dir"
+        err "sing-box 未保持运行或节点端口未监听，未创建新节点。"
+        return 1
+    fi
 
     cleanup_node_backup "$backup_dir"
 
+    info "创建完成，节点链接如下："
+    view_node_link
+}
+
+create_vless_reality_node() {
+    local backup_dir existing_port="" confirm input_host domain default_name input_name name port
+    local input_sni server_name uuid short_id private_key public_key
+    local -a keypair
+
+    backup_dir="$(mktemp -d /tmp/vpsbox-node-backup.XXXXXX)"
+    backup_node_files "$backup_dir"
+
+    if node_exists; then
+        existing_port="$PORT"
+        warn "检测到已有 ${PROTOCOL:-shadowsocks} 节点。"
+        read -r -p "创建 VLESS Reality 将替换当前节点，是否继续？(y/N): " confirm
+        [[ "$confirm" =~ ^[Yy]$ ]] || { cleanup_node_backup "$backup_dir"; info "已取消。"; return 0; }
+    fi
+
+    if ! install_singbox_if_missing; then
+        cleanup_node_backup "$backup_dir"
+        err "sing-box 安装失败，未创建新节点。"
+        return 1
+    fi
+
+    while true; do
+        read -r -p "请输入节点连接地址（域名或 IP）：" input_host
+        domain="$(normalize_host "$input_host")"
+        if ! is_valid_node_host "$domain"; then
+            err "格式不正确，请输入类似 sb.example.com、1.2.3.4 或 2001:db8::1。"
+            continue
+        fi
+        break
+    done
+
+    default_name="$(default_name_for_host "$domain")"
+    default_name="vless-${default_name#ss-}"
+    read -r -p "请输入节点名称，留空默认 ${default_name}：" input_name
+    name="$(sanitize_name "${input_name:-$default_name}")"
+
+    while true; do
+        read -r -p "请输入 Reality 目标域名/SNI：" input_sni
+        server_name="$(normalize_host "$input_sni")"
+        if ! is_domain_name "$server_name"; then
+            err "Reality 目标必须是有效域名，不能使用 IP 地址。"
+            continue
+        fi
+        info "正在检查 Reality 目标的 DNS 与 TLS 443 可达性..."
+        if ! check_reality_server "$server_name"; then
+            err "目标域名无法解析或 TLS 443 不可达，请更换。"
+            continue
+        fi
+        break
+    done
+
+    if ! port="$(choose_node_port "$existing_port")"; then
+        cleanup_node_backup "$backup_dir"
+        err "节点端口选择失败，未创建新节点。"
+        return 1
+    fi
+    info "节点端口：$port"
+
+    uuid="$(sing-box generate uuid 2>/dev/null | tr -d '\r\n')"
+    if [[ ! "$uuid" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+        cleanup_node_backup "$backup_dir"
+        err "UUID 生成失败，未创建新节点。"
+        return 1
+    fi
+    mapfile -t keypair < <(generate_reality_keypair) || true
+    if [ "${#keypair[@]}" -ne 2 ]; then
+        cleanup_node_backup "$backup_dir"
+        err "Reality 密钥生成失败，未创建新节点。"
+        return 1
+    fi
+    private_key="${keypair[0]}"
+    public_key="${keypair[1]}"
+    short_id="$(sing-box generate rand 8 --hex 2>/dev/null | tr -d '\r\n')"
+    if [[ ! "$short_id" =~ ^[0-9A-Fa-f]{16}$ ]]; then
+        cleanup_node_backup "$backup_dir"
+        err "Reality Short ID 生成失败，未创建新节点。"
+        return 1
+    fi
+
+    info "正在写入 VLESS Reality 配置..."
+    if ! write_vless_reality_config "$port" "$uuid" "$server_name" "$private_key" "$short_id"; then
+        restore_node_files "$backup_dir"
+        err "配置检查失败，未创建新节点。"
+        return 1
+    fi
+    if ! save_vless_reality_state "$domain" "$name" "$port" "$uuid" "$server_name" "$public_key" "$short_id"; then
+        restore_node_files "$backup_dir"
+        err "状态文件写入失败，未创建新节点。"
+        return 1
+    fi
+    if ! write_uri_file || ! setup_service; then
+        restore_node_files "$backup_dir"
+        err "节点链接或服务配置失败，未创建新节点。"
+        return 1
+    fi
+    info "正在启动 sing-box 服务..."
+    if ! service_restart || ! service_is_running || ! wait_for_port_listener "$port"; then
+        restore_node_files "$backup_dir"
+        err "sing-box 未保持运行或节点端口未监听，未创建新节点。"
+        return 1
+    fi
+    cleanup_node_backup "$backup_dir"
     info "创建完成，节点链接如下："
     view_node_link
 }
@@ -1437,6 +1913,22 @@ view_node_link() {
 
     load_state
     write_uri_file
+
+    if [ "$PROTOCOL" = "vless-reality" ]; then
+        cat <<EOF
+========================================
+ 当前 VLESS Reality 节点
+========================================
+ 节点地址：${DOMAIN}:${PORT}
+ Reality SNI：${REALITY_SERVER_NAME}
+ 流控：${FLOW}
+----------------------------------------
+ 链接：
+ $(cat "$URI_FILE")
+========================================
+EOF
+        return 0
+    fi
 
     cat <<EOF
 ========================================
@@ -1465,7 +1957,7 @@ delete_node() {
     }
     node_port="$PORT"
 
-    read -r -p "确认删除当前 SS 节点？sing-box 服务将停止。(y/N): " confirm
+    read -r -p "确认删除当前 ${PROTOCOL:-shadowsocks} 节点？sing-box 服务将停止。(y/N): " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消。"; return 0; }
 
     if service_is_running && ! service_stop; then
@@ -1489,7 +1981,7 @@ delete_node() {
 }
 
 update_singbox() {
-    local binary_path backup_dir backup_binary
+    local binary_path backup_dir backup_binary old_version
     local was_active=0 was_enabled=0
 
     if ! singbox_installed; then
@@ -1499,6 +1991,8 @@ update_singbox() {
     fi
 
     binary_path="$(command -v sing-box)"
+    old_version="$(singbox_version)"
+    [[ "$old_version" =~ ^[0-9]+([.][0-9]+){2}$ ]] || { err "无法识别当前 sing-box 版本，已取消更新。"; return 1; }
     backup_dir="$(mktemp -d /tmp/vpsbox-sing-box-update.XXXXXX)" || return 1
     backup_binary="$backup_dir/sing-box"
     cp -a "$binary_path" "$backup_binary" || { rm -rf "$backup_dir"; err "备份当前 sing-box 二进制失败，已取消更新。"; return 1; }
@@ -1510,7 +2004,7 @@ update_singbox() {
         was_enabled=1
     fi
 
-    install_deps
+    install_deps || return 1
     info "正在更新 sing-box..."
     if ! run_singbox_installer; then
         rm -rf "$backup_dir"
@@ -1520,14 +2014,20 @@ update_singbox() {
     if node_exists; then
         if ! sing-box check -c "$CONFIG_PATH" >/dev/null; then
             err "当前节点配置未通过新版 sing-box 检查，正在恢复旧二进制。"
-            cp -a "$backup_binary" "$binary_path" || err "恢复旧二进制失败：$backup_binary"
+            if ! run_singbox_installer "$old_version"; then
+                cp -a "$backup_binary" "$binary_path" || err "恢复旧二进制失败：$backup_binary"
+            fi
             rm -rf "$backup_dir"
             return 1
         fi
         if ! setup_service || ! service_restart || ! service_is_running; then
             err "新版 sing-box 未能正常启动，正在恢复旧二进制。"
             service_stop 2>/dev/null || true
-            cp -a "$backup_binary" "$binary_path" || { err "恢复旧二进制失败：$backup_binary"; rm -rf "$backup_dir"; return 1; }
+            if ! run_singbox_installer "$old_version" && ! cp -a "$backup_binary" "$binary_path"; then
+                err "恢复旧版 sing-box 失败：$backup_binary"
+                rm -rf "$backup_dir"
+                return 1
+            fi
             if [ "$was_enabled" -eq 1 ]; then service_enable || true; else service_disable || true; fi
             if [ "$was_active" -eq 1 ] && ! service_start; then
                 err "旧版 sing-box 已恢复，但服务未能重新启动。"
@@ -2971,12 +3471,12 @@ $SSHD_VPSBOX_PORT_CONF
  0) 返回
 ========================================
 EOF
-        read -r -p "请输入选项: " opt
+        read -r -p "请输入选项: " opt || exit 0
         echo ""
 
         case "$opt" in
-            1) apply_ssh_port_change; pause ;;
-            2) restore_vpsbox_ssh_config; pause ;;
+            1) run_menu_action apply_ssh_port_change; pause ;;
+            2) run_menu_action restore_vpsbox_ssh_config; pause ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
@@ -3019,11 +3519,11 @@ $SSHD_VPSBOX_HARDENING_CONF
  0) 返回
 ========================================
 EOF
-        read -r -p "请输入选项: " opt
+        read -r -p "请输入选项: " opt || exit 0
         echo ""
 
         case "$opt" in
-            1) apply_ssh_basic_hardening; pause ;;
+            1) run_menu_action apply_ssh_basic_hardening; pause ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
@@ -3299,7 +3799,10 @@ EOF
     elif node_exists; then
         load_state
         has_node="1"
-        check_ok "当前节点" "${DOMAIN:-未知}:${PORT:-未知}"
+        check_ok "当前节点" "${PROTOCOL:-shadowsocks} ${DOMAIN:-未知}:${PORT:-未知}"
+        if [ "${PROTOCOL:-}" = "vless-reality" ]; then
+            check_ok "Reality SNI" "${REALITY_SERVER_NAME:-未知}"
+        fi
     else
         check_warn "当前节点" "未创建"
     fi
@@ -3422,6 +3925,8 @@ nexttrace_installed() {
 }
 
 ensure_nexttrace() {
+    local arch asset tmp
+
     if nexttrace_installed; then
         return 0
     fi
@@ -3430,32 +3935,25 @@ ensure_nexttrace() {
     read -r -p "是否自动安装 nexttrace？(y/N): " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消。"; return 1; }
 
-    ensure_curl || return 1
+    install_deps || return 1
 
-    local tmp
-    if command -v mktemp >/dev/null 2>&1; then
-        tmp="$(mktemp /tmp/vpsbox-nexttrace-install.XXXXXX)"
-    else
-        tmp="/tmp/vpsbox-nexttrace-install.$$"
-        : > "$tmp"
-    fi
-
-    info "正在安装 nexttrace..."
-    if ! retry 3 2 curl -fsSL https://nxtrace.org/nt -o "$tmp"; then
+    case "$(uname -m)" in
+        x86_64) arch="amd64" ;;
+        aarch64) arch="arm64" ;;
+        armv7l|armv7) arch="armv7" ;;
+        i?86) arch="386" ;;
+        *) err "不支持的 nexttrace 架构：$(uname -m)"; return 1 ;;
+    esac
+    asset="nexttrace_linux_$arch"
+    tmp="$(mktemp "/tmp/$asset.XXXXXX")" || return 1
+    info "正在下载并校验 nexttrace v$NEXTTRACE_RELEASE_VERSION（$asset）..."
+    if ! download_verified_github_asset "nxtrace/NTrace-core" "v$NEXTTRACE_RELEASE_VERSION" "$asset" "$tmp"; then
         rm -f "$tmp"
-        err "nexttrace 安装脚本下载失败，请检查网络后重试。"
         return 1
     fi
-
-    if ! bash -n "$tmp"; then
+    if ! install -o root -g root -m 755 "$tmp" /usr/local/bin/nexttrace; then
         rm -f "$tmp"
-        err "nexttrace 安装脚本未通过语法检查，已取消执行。"
-        return 1
-    fi
-
-    if ! bash "$tmp"; then
-        rm -f "$tmp"
-        err "nexttrace 安装失败，请检查网络后重试。"
+        err "安装 nexttrace 二进制失败。"
         return 1
     fi
     rm -f "$tmp"
@@ -3727,7 +4225,7 @@ change_system_hostname() {
         rm -f "$tmp"
         restore_change_file HOSTNAME_FILE /etc/hostname || true
         restore_change_file HOSTS_FILE /etc/hosts || true
-        hostnamectl set-hostname "$old" 2>/dev/null || true
+        set_system_hostname "$old" 2>/dev/null || true
         err "更新 /etc/hosts 失败，已恢复原配置。"
         return 1
     fi
@@ -3755,12 +4253,27 @@ cleanup_preview() {
 cleanup_old_temp_files() {
     local path="$1"
     [ -d "$path" ] || return 0
-    find "$path" -xdev -type f -user root -mtime +7 -print -delete 2>/dev/null || true
+    find "$path" -xdev -maxdepth 1 -type f -user root -name 'vpsbox-*' -mtime +7 -print -delete 2>/dev/null || true
+}
+
+cleanup_orphaned_change_backups() {
+    local backup name state
+    [ -d "$CHANGE_BACKUP_DIR" ] || return 0
+    for backup in "$CHANGE_BACKUP_DIR"/*; do
+        [ -f "$backup" ] || continue
+        name="${backup##*/}"
+        [[ "$name" =~ ^[A-Z0-9_]+$ ]] || continue
+        state="$(manifest_value "BACKUP_$name" 2>/dev/null || true)"
+        [ "$state" = "file" ] && continue
+        if find "$backup" -xdev -type f -mtime +30 -print -delete 2>/dev/null; then
+            info "已清理未引用的 VPSBox 备份：$name"
+        fi
+    done
 }
 
 cleanup_system_garbage() {
     local confirm journal_confirm
-    echo "将扫描并清理：包管理器缓存、超过 7 天的 root 临时文件、VPSBox 过期备份。"
+    echo "将扫描并清理：包管理器缓存、超过 7 天的 VPSBox 临时文件、未引用的 VPSBox 过期备份。"
     echo "不会清理节点配置、用户主目录、Docker 数据卷或数据库。"
     cleanup_preview
     read -r -p "确认执行垃圾清理？请输入 YES：" confirm
@@ -3772,9 +4285,7 @@ cleanup_system_garbage() {
     if command -v apk >/dev/null 2>&1; then apk cache clean || warn "APK 缓存清理失败。"; fi
     cleanup_old_temp_files /tmp
     cleanup_old_temp_files /var/tmp
-    if [ -d "$CHANGE_BACKUP_DIR" ]; then
-        find "$CHANGE_BACKUP_DIR" -xdev -type f -mtime +30 -delete 2>/dev/null || warn "VPSBox 过期备份清理不完整。"
-    fi
+    cleanup_orphaned_change_backups || warn "VPSBox 未引用备份清理不完整。"
     if command -v journalctl >/dev/null 2>&1; then
         read -r -p "是否清理超过 30 天的 systemd 日志？请输入 YES，其他输入跳过：" journal_confirm
         if [ "$journal_confirm" = "YES" ]; then
@@ -3788,14 +4299,15 @@ cleanup_system_garbage() {
 }
 
 show_vpsbox_changes() {
-    local name
+    local name found=0
     echo "VPSBox 已记录的系统变更："
     for name in HOSTNAME DNS_RESOLV DNS_RESOLVED BBR_CONF GAI_CONF FAIL2BAN_SSHD NTP_CONF JOURNALD_CONF; do
         if [ "$(manifest_value "APPLIED_$name" 2>/dev/null || true)" = "1" ]; then
             printf ' - %s：可恢复\n' "$name"
+            found=1
         fi
     done
-    [ -f "$CHANGE_MANIFEST" ] || echo " - 无"
+    [ "$found" -eq 1 ] || echo " - 无"
     echo "SSH 配置不会由此功能自动恢复，请保持当前连接并手动核验后处理。"
 }
 
@@ -3815,52 +4327,75 @@ restore_vpsbox_system_changes() {
 
     if [ "$(manifest_value APPLIED_DNS_RESOLV 2>/dev/null || true)" = "1" ] && ! restore_change_file DNS_RESOLV /etc/resolv.conf; then failed=1; fi
     if [ "$(manifest_value APPLIED_DNS_RESOLVED 2>/dev/null || true)" = "1" ] && ! restore_change_file DNS_RESOLVED /etc/systemd/resolved.conf.d/vpsbox.conf; then failed=1; fi
-    if resolv_conf_managed_by_systemd_resolved; then systemctl restart systemd-resolved 2>/dev/null || true; fi
+    if resolv_conf_managed_by_systemd_resolved && ! systemctl restart systemd-resolved; then failed=1; fi
 
     if [ "$(manifest_value APPLIED_BBR_CONF 2>/dev/null || true)" = "1" ]; then
         restore_change_file BBR_CONF "$BBR_CONF" || failed=1
         cc="$(manifest_value BBR_CC 2>/dev/null || true)"; fq="$(manifest_value BBR_FQ 2>/dev/null || true)"
-        [ -n "$cc" ] && [ "$cc" != "unknown" ] && sysctl -w "net.ipv4.tcp_congestion_control=$cc" >/dev/null 2>&1 || true
-        [ -n "$fq" ] && [ "$fq" != "unknown" ] && sysctl -w "net.core.default_qdisc=$fq" >/dev/null 2>&1 || true
+        if [ -n "$cc" ] && [ "$cc" != "unknown" ]; then sysctl -w "net.ipv4.tcp_congestion_control=$cc" >/dev/null 2>&1 || failed=1; fi
+        if [ -n "$fq" ] && [ "$fq" != "unknown" ]; then sysctl -w "net.core.default_qdisc=$fq" >/dev/null 2>&1 || failed=1; fi
     fi
     if [ "$(manifest_value APPLIED_GAI_CONF 2>/dev/null || true)" = "1" ] && ! restore_change_file GAI_CONF "$GAI_CONF"; then failed=1; fi
     if [ "$(manifest_value APPLIED_FAIL2BAN_SSHD 2>/dev/null || true)" = "1" ]; then
         restore_change_file FAIL2BAN_SSHD "$FAIL2BAN_VPSBOX_SSHD_CONF" || failed=1
-        fail2ban_installed && systemctl restart fail2ban 2>/dev/null || true
+        if fail2ban_installed; then
+            if is_systemd; then
+                systemctl restart fail2ban && systemctl is-active --quiet fail2ban || failed=1
+            elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
+                rc-service fail2ban restart && rc-service fail2ban status >/dev/null || failed=1
+            else
+                failed=1
+            fi
+        fi
     fi
     if [ "$(manifest_value APPLIED_JOURNALD_CONF 2>/dev/null || true)" = "1" ]; then
         restore_change_file JOURNALD_CONF "$JOURNALD_VPSBOX_CONF" || failed=1
-        systemctl restart systemd-journald 2>/dev/null || true
+        is_systemd && systemctl restart systemd-journald && systemctl is-active --quiet systemd-journald || failed=1
     fi
     if [ "$(manifest_value APPLIED_NTP_CONF 2>/dev/null || true)" = "1" ]; then
+        is_systemd || { err "当前环境无法恢复 systemd 管理的 NTP 状态。"; failed=1; }
         chrony="$(chrony_service_name)"
-        systemctl stop "$chrony" 2>/dev/null || true
+        systemctl stop "$chrony" || failed=1
         restore_change_file NTP_CONF "$(chrony_conf_path)" || failed=1
         restore_change_file NTP_SOURCES /etc/chrony/sources.d/vpsbox.sources || failed=1
-        [ "$(manifest_value NTP_CHRONY_ENABLED 2>/dev/null || true)" = "enabled" ] && systemctl enable "$chrony" 2>/dev/null || systemctl disable "$chrony" 2>/dev/null || true
-        [ "$(manifest_value NTP_CHRONY_ACTIVE 2>/dev/null || true)" = "active" ] && systemctl start "$chrony" 2>/dev/null || true
+        if [ "$(manifest_value NTP_CHRONY_ENABLED 2>/dev/null || true)" = "enabled" ]; then systemctl enable "$chrony" || failed=1; else systemctl disable "$chrony" || failed=1; fi
+        if [ "$(manifest_value NTP_CHRONY_ACTIVE 2>/dev/null || true)" = "active" ]; then systemctl start "$chrony" || failed=1; else systemctl stop "$chrony" || failed=1; fi
         timesyncd="$(manifest_value NTP_TIMESYNCD_ENABLED 2>/dev/null || true)"
-        [ "$timesyncd" = "enabled" ] && systemctl enable systemd-timesyncd 2>/dev/null || true
-        [ "$(manifest_value NTP_TIMESYNCD_ACTIVE 2>/dev/null || true)" = "active" ] && systemctl start systemd-timesyncd 2>/dev/null || true
+        if [ "$timesyncd" = "enabled" ]; then systemctl enable systemd-timesyncd || failed=1; else systemctl disable systemd-timesyncd || failed=1; fi
+        if [ "$(manifest_value NTP_TIMESYNCD_ACTIVE 2>/dev/null || true)" = "active" ]; then systemctl start systemd-timesyncd || failed=1; else systemctl stop systemd-timesyncd || failed=1; fi
     fi
     if [ "$failed" -eq 1 ]; then
         err "部分文件恢复失败；已保留变更清单和备份，请修复权限或路径后重试。"
         return 1
     fi
-    for name in HOSTNAME_FILE HOSTS_FILE DNS_RESOLV DNS_RESOLVED BBR_CONF GAI_CONF FAIL2BAN_SSHD JOURNALD_CONF NTP_CONF NTP_SOURCES; do
-        [ "$(manifest_value "APPLIED_$name" 2>/dev/null || true)" = "1" ] && clear_change_tracking "$name" || true
+    if [ "$(manifest_value APPLIED_HOSTNAME 2>/dev/null || true)" = "1" ]; then
+        clear_change_tracking HOSTNAME_FILE || failed=1
+        clear_change_tracking HOSTS_FILE || failed=1
+        manifest_remove APPLIED_HOSTNAME || failed=1
+        manifest_remove HOSTNAME_VALUE || failed=1
+    fi
+    if [ "$(manifest_value APPLIED_BBR_CONF 2>/dev/null || true)" = "1" ]; then
+        clear_change_tracking BBR_CONF || failed=1
+        manifest_remove BBR_CC || failed=1
+        manifest_remove BBR_FQ || failed=1
+    fi
+    if [ "$(manifest_value APPLIED_NTP_CONF 2>/dev/null || true)" = "1" ]; then
+        clear_change_tracking NTP_CONF || failed=1
+        clear_change_tracking NTP_SOURCES || failed=1
+        manifest_remove NTP_CHRONY_ACTIVE || failed=1
+        manifest_remove NTP_CHRONY_ENABLED || failed=1
+        manifest_remove NTP_TIMESYNCD_ACTIVE || failed=1
+        manifest_remove NTP_TIMESYNCD_ENABLED || failed=1
+    fi
+    for name in DNS_RESOLV DNS_RESOLVED GAI_CONF FAIL2BAN_SSHD JOURNALD_CONF; do
+        if [ "$(manifest_value "APPLIED_$name" 2>/dev/null || true)" = "1" ]; then
+            clear_change_tracking "$name" || failed=1
+        fi
     done
-    clear_change_tracking HOSTNAME_FILE || true
-    clear_change_tracking HOSTS_FILE || true
-    manifest_remove APPLIED_HOSTNAME || true
-    manifest_remove HOSTNAME_VALUE || true
-    clear_change_tracking NTP_SOURCES || true
-    manifest_remove NTP_CHRONY_ACTIVE || true
-    manifest_remove NTP_CHRONY_ENABLED || true
-    manifest_remove NTP_TIMESYNCD_ACTIVE || true
-    manifest_remove NTP_TIMESYNCD_ENABLED || true
-    manifest_remove BBR_CC || true
-    manifest_remove BBR_FQ || true
+    if [ "$failed" -eq 1 ]; then
+        err "恢复已完成部分步骤，但清单或备份清理失败，已保留剩余状态供人工核验。"
+        return 1
+    fi
     info "已恢复已记录项目；请使用自检和对应服务状态确认结果。"
 }
 
@@ -3869,9 +4404,9 @@ start_service_action() {
         warn "当前没有节点配置，请先创建节点。"
         return 0
     fi
-    install_singbox_if_missing
-    setup_service
-    service_start
+    install_singbox_if_missing || return 1
+    setup_service || return 1
+    service_start || return 1
     info "sing-box 服务已启动。"
 }
 
@@ -3880,10 +4415,15 @@ restart_service_action() {
         warn "当前没有节点配置，请先创建节点。"
         return 0
     fi
-    install_singbox_if_missing
-    setup_service
-    service_restart
+    install_singbox_if_missing || return 1
+    setup_service || return 1
+    service_restart || return 1
     info "sing-box 服务已重启。"
+}
+
+stop_service_action() {
+    service_stop || return 1
+    info "sing-box 服务已停止。"
 }
 
 singbox_install_state() {
@@ -3891,7 +4431,15 @@ singbox_install_state() {
 }
 
 node_state() {
-    node_exists && echo "已创建" || echo "未创建"
+    if node_exists; then
+        load_state
+        case "$PROTOCOL" in
+            vless-reality) echo "VLESS Reality" ;;
+            *) echo "SS 2022" ;;
+        esac
+    else
+        echo "未创建"
+    fi
 }
 
 node_address() {
@@ -4056,18 +4604,20 @@ node_menu() {
  节点地址：$(node_address)
 ----------------------------------------
  1) 创建/重建 SS 2022 节点
- 2) 查看节点链接
- 3) 删除当前节点
+ 2) 创建/重建 VLESS Reality 节点
+ 3) 查看节点链接
+ 4) 删除当前节点
  0) 返回主菜单
 ========================================
 EOF
-        read -r -p "请输入选项: " opt
+        read -r -p "请输入选项: " opt || exit 0
         echo ""
 
         case "$opt" in
-            1) create_or_rebuild_node; pause ;;
-            2) view_node_link; pause ;;
-            3) delete_node; pause ;;
+            1) run_menu_action create_or_rebuild_node; pause ;;
+            2) run_menu_action create_vless_reality_node; pause ;;
+            3) run_menu_action view_node_link; pause ;;
+            4) run_menu_action delete_node; pause ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
@@ -4094,14 +4644,14 @@ singbox_menu() {
  0) 返回主菜单
 ========================================
 EOF
-        read -r -p "请输入选项: " opt
+        read -r -p "请输入选项: " opt || exit 0
         echo ""
 
         case "$opt" in
-            1) start_service_action; pause ;;
-            2) service_stop && info "sing-box 服务已停止。"; pause ;;
-            3) restart_service_action; pause ;;
-            4) update_singbox; pause ;;
+            1) run_menu_action start_service_action; pause ;;
+            2) run_menu_action stop_service_action; pause ;;
+            3) run_menu_action restart_service_action; pause ;;
+            4) run_menu_action update_singbox; pause ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
@@ -4143,23 +4693,23 @@ system_menu() {
  0) 返回主菜单
 ========================================
 EOF
-        read -r -p "请输入选项: " opt
+        read -r -p "请输入选项: " opt || exit 0
         echo ""
 
         case "$opt" in
-            1) update_system_packages; pause ;;
-            2) enable_bbr_fq; pause ;;
-            3) install_fail2ban; pause ;;
-            4) limit_systemd_journal; pause ;;
-            5) change_ipv4_dns; pause ;;
-            6) enable_ipv4_priority; pause ;;
+            1) run_menu_action update_system_packages; pause ;;
+            2) run_menu_action enable_bbr_fq; pause ;;
+            3) run_menu_action install_fail2ban; pause ;;
+            4) run_menu_action limit_systemd_journal; pause ;;
+            5) run_menu_action change_ipv4_dns; pause ;;
+            6) run_menu_action enable_ipv4_priority; pause ;;
             7) ssh_port_change_menu ;;
             8) ssh_basic_hardening_menu ;;
-            9) show_current_ssh_config; pause ;;
-            10) enable_ntp_sync; pause ;;
-            11) restore_vpsbox_system_changes; pause ;;
-            12) cleanup_system_garbage; pause ;;
-            13) change_system_hostname; pause ;;
+            9) run_menu_action show_current_ssh_config; pause ;;
+            10) run_menu_action enable_ntp_sync; pause ;;
+            11) run_menu_action restore_vpsbox_system_changes; pause ;;
+            12) run_menu_action cleanup_system_garbage; pause ;;
+            13) run_menu_action change_system_hostname; pause ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
@@ -4169,15 +4719,15 @@ EOF
 main_loop() {
     while true; do
         show_menu
-        read -r -p "请输入选项: " opt
+        read -r -p "请输入选项: " opt || exit 0
         echo ""
 
         case "$opt" in
-            1) node_menu ;;
-            2) singbox_menu ;;
-            3) system_menu ;;
-            4) run_self_check; pause ;;
-            5) show_backtrace_routes; pause ;;
+            1) run_menu_action node_menu ;;
+            2) run_menu_action singbox_menu ;;
+            3) run_menu_action system_menu ;;
+            4) run_menu_action run_self_check; pause ;;
+            5) run_menu_action show_backtrace_routes; pause ;;
             8) update_vpsbox; pause ;;
             9) uninstall_all; pause ;;
             0) exit 0 ;;

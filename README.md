@@ -56,8 +56,9 @@ vpsbox
 ```text
 节点管理
 1) 创建/重建 SS 2022 节点
-2) 查看节点链接
-3) 删除当前节点
+2) 创建/重建 VLESS Reality 节点
+3) 查看节点链接
+4) 删除当前节点
 0) 返回主菜单
 
 sing-box 管理
@@ -84,7 +85,8 @@ sing-box 管理
 ## 功能
 
 - 自动检查并安装 sing-box
-- 创建/重建 SS 2022 节点
+- 创建/重建 SS 2022 节点（可手动指定端口，留空自动随机）
+- 创建/重建 VLESS Reality 节点（分别输入客户端连接地址与 Reality 目标域名/SNI）
 - 校验节点域名/IP 格式
 - 随机端口
 - 随机强密码
@@ -113,16 +115,19 @@ sing-box 管理
 ## 安全与恢复说明
 
 - 节点状态文件按固定字段解析，不作为 Shell 脚本执行；配置目录拒绝符号链接，并要求 root 所有权和限制性权限。
+- VLESS Reality 会分别保存客户端连接地址和 Reality 目标域名；创建前检查目标 DNS 与 TLS 443 可达性，私钥只写入权限为 `600` 的服务端配置，不写入节点链接或状态文件。
+- VPSBox 锁会记录进程身份与终端；异常断开后失去有效终端的旧菜单会在下次启动时自动回收，仍在有效终端中的会话须明确确认后才会结束。
 - 修改普通 `/etc/resolv.conf` 前必须成功备份，写入时保留非 `nameserver` 行，修改后验证域名解析；未知 DNS 符号链接会拒绝直接覆盖。
 - 修改 systemd-resolved 配置失败或解析验证失败时，会恢复原配置并尝试重新启动服务。
 - 配置 chrony 时会先备份配置并确认 chrony 可用，再停用 systemd-timesyncd；后续步骤失败会恢复原 NTP 配置和服务状态。
 - journald 限制写入 `/etc/systemd/journald.conf.d/99-vpsbox.conf`，不会直接改写发行版主配置；重启或生效检查失败会回滚该 drop-in。
 - BBR/fq 仅在内核模块加载和运行时参数验证均通过后才保存到 `/etc/sysctl.d/99-vpsbox-bbr.conf`。
-- sing-box 更新会临时备份当前命令解析到的二进制；若新版不能通过节点配置检查或服务不能恢复，会尝试还原该二进制。通过系统包管理器升级的相关依赖不保证降级。
+- sing-box 安装与更新使用固定的官方 GitHub Release 版本，并校验 Release 提供的 SHA256；更新失败时会尝试重新安装原版本，再以旧二进制作为最后恢复手段。
 - VPSBox 将自己修改前的 DNS、BBR、IPv4 优先、Fail2ban、chrony 和 journald 文件保存到 `/etc/vpsbox/`，可在“系统优化”菜单中查看并输入 `YES` 恢复；恢复成功后会清除对应清单标记。
 - SSH 主配置与 VPSBox drop-in 也会保存到该目录，但只能在“修改 SSH 端口”子菜单中单独恢复。恢复前会提示连接风险，恢复后执行 `sshd -t`、重启 SSH 并确认原端口监听；请先准备控制台或备用连接。
 - 系统工具提供垃圾清理和主机名修改：垃圾清理先预览并分项确认，只处理包缓存、过期临时文件、VPSBox 过期备份和明确确认的历史日志；主机名修改会备份 `/etc/hostname` 与 `/etc/hosts` 并支持恢复。
-- Alpine 安装 sing-box 时使用官方安装脚本按架构获取稳定版发布包，不再混用 Alpine `edge/community` 源；Debian/Ubuntu 安装流程不变。
+- sing-box 当前固定为 `v1.13.14`，按发行版和架构下载官方 Release 包；Alpine 不再混用 `edge/community` 源，Debian/Ubuntu 同样使用经过 SHA256 校验的官方包。
+- NextTrace 当前固定为 `v1.7.1`，从官方 GitHub Release 下载并校验 SHA256 后安装；不再执行远程安装脚本。
 - 删除节点前会确认 sing-box 已停止、节点端口不再监听，并尝试禁用开机启动。
 - VPSBox 更新必须通过菜单手动触发；新脚本需包含有效版本号并通过 Bash 语法检查，旧脚本保留在 `/usr/local/bin/vpsbox.previous`。
 - 卸载 VPSBox 不会自动恢复已经应用的 SSH、DNS、BBR、IPv4 优先、Fail2ban、NTP 或 journald 系统设置。
