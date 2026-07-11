@@ -799,22 +799,21 @@ service_stop() {
     fi
 }
 
-service_restart() {
-    if is_systemd; then
-        retry 3 2 systemctl restart "$SERVICE_NAME"
-    elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
-        retry 3 2 rc-service "$SERVICE_NAME" restart
-    else
-        err "未检测到 systemd/OpenRC，无法管理服务。"
-        return 1
-    fi
-}
-
 service_enable() {
     if is_systemd; then
         systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
     elif [ "$OS" = "alpine" ] && command -v rc-update >/dev/null 2>&1; then
         rc-update add "$SERVICE_NAME" default >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
+service_is_enabled() {
+    if is_systemd; then
+        systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null
+    elif [ "$OS" = "alpine" ]; then
+        [ -e "/etc/runlevels/default/$SERVICE_NAME" ] || [ -L "/etc/runlevels/default/$SERVICE_NAME" ]
     else
         return 1
     fi
@@ -1388,29 +1387,37 @@ write_uri_file() {
 
 backup_node_files() {
     local backup_dir="$1"
-    mkdir -p "$backup_dir"
+    mkdir -p "$backup_dir" || return 1
 
-    [ -f "$CONFIG_PATH" ] && cp -a "$CONFIG_PATH" "$backup_dir/config.json"
-    [ -f "$STATE_FILE" ] && cp -a "$STATE_FILE" "$backup_dir/state.env"
-    [ -f "$URI_FILE" ] && cp -a "$URI_FILE" "$backup_dir/node-uri.txt"
-    [ -f /etc/systemd/system/sing-box.service ] && cp -a /etc/systemd/system/sing-box.service "$backup_dir/sing-box.service"
-    [ -f /etc/init.d/sing-box ] && cp -a /etc/init.d/sing-box "$backup_dir/openrc-sing-box"
+    if [ -f "$CONFIG_PATH" ]; then cp -a "$CONFIG_PATH" "$backup_dir/config.json" || return 1; fi
+    if [ -f "$STATE_FILE" ]; then cp -a "$STATE_FILE" "$backup_dir/state.env" || return 1; fi
+    if [ -f "$URI_FILE" ]; then cp -a "$URI_FILE" "$backup_dir/node-uri.txt" || return 1; fi
+    if [ -f /etc/systemd/system/sing-box.service ]; then cp -a /etc/systemd/system/sing-box.service "$backup_dir/sing-box.service" || return 1; fi
+    if [ -f /etc/init.d/sing-box ]; then cp -a /etc/init.d/sing-box "$backup_dir/openrc-sing-box" || return 1; fi
 
     if service_is_running; then
         echo "1" > "$backup_dir/service-running"
     else
         echo "0" > "$backup_dir/service-running"
     fi
+    if service_is_enabled; then
+        echo "1" > "$backup_dir/service-enabled"
+    else
+        echo "0" > "$backup_dir/service-enabled"
+    fi
 }
 
 restore_node_files() {
     local backup_dir="$1"
     local was_running="0"
+    local was_enabled="0"
 
     [ -f "$backup_dir/service-running" ] && was_running="$(cat "$backup_dir/service-running")"
+    [ -f "$backup_dir/service-enabled" ] && was_enabled="$(cat "$backup_dir/service-enabled")"
 
     warn "创建失败，正在恢复旧配置..."
     service_stop 2>/dev/null || true
+    stop_singbox_config_processes 2>/dev/null || true
 
     rm -f "$CONFIG_PATH" "$STATE_FILE" "$URI_FILE"
     [ -f "$backup_dir/config.json" ] && cp -a "$backup_dir/config.json" "$CONFIG_PATH"
@@ -1434,9 +1441,18 @@ restore_node_files() {
         fi
     fi
 
+    if [ "$was_enabled" = "1" ]; then
+        service_enable 2>/dev/null || warn "旧配置已恢复，但 sing-box 开机启动状态恢复失败。"
+    else
+        service_disable 2>/dev/null || true
+    fi
+
     if [ "$was_running" = "1" ] && [ -f "$CONFIG_PATH" ] && singbox_installed; then
-        restart_singbox_cleanly 2>/dev/null || true
-        info "旧配置已恢复，sing-box 已尝试重启。"
+        if restart_singbox_cleanly 2>/dev/null; then
+            info "旧配置与运行状态已恢复。"
+        else
+            warn "旧配置已恢复，但 sing-box 运行状态恢复失败，请手动检查服务。"
+        fi
     else
         info "已恢复到创建前状态。"
     fi
@@ -1809,8 +1825,12 @@ EOF
 create_or_rebuild_node() {
     local backup_dir
     local existing_port=""
-    backup_dir="$(mktemp -d /tmp/vpsbox-node-backup.XXXXXX)"
-    backup_node_files "$backup_dir"
+    backup_dir="$(mktemp -d /tmp/vpsbox-node-backup.XXXXXX)" || return 1
+    if ! backup_node_files "$backup_dir"; then
+        cleanup_node_backup "$backup_dir"
+        err "备份当前节点失败，已取消重建。"
+        return 1
+    fi
 
     if node_exists; then
         existing_port="$PORT"
@@ -1940,8 +1960,12 @@ create_vless_reality_node() {
     local input_sni server_name uuid short_id private_key public_key
     local -a keypair
 
-    backup_dir="$(mktemp -d /tmp/vpsbox-node-backup.XXXXXX)"
-    backup_node_files "$backup_dir"
+    backup_dir="$(mktemp -d /tmp/vpsbox-node-backup.XXXXXX)" || return 1
+    if ! backup_node_files "$backup_dir"; then
+        cleanup_node_backup "$backup_dir"
+        err "备份当前节点失败，已取消重建。"
+        return 1
+    fi
 
     if node_exists; then
         existing_port="$PORT"
