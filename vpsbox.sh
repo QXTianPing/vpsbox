@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="VPSBox"
-VPSBOX_VERSION="v1.0.0"
+VPSBOX_VERSION="v1.0.1"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
@@ -96,7 +96,7 @@ retry() {
 
 pause() {
     echo ""
-    read -r -p "按回车返回主菜单..." _ || exit 0
+    read -r -p "按回车返回当前菜单..." _ || exit 0
 }
 
 run_menu_action() {
@@ -4795,6 +4795,7 @@ node_menu() {
 ========================================
  当前节点：$(node_state)
  节点地址：$(node_address)
+ sing-box 状态：$(service_status_short)
 ----------------------------------------
  1) 创建/重建 SS 2022 节点
  2) 创建/重建 VLESS Reality 节点
@@ -4871,18 +4872,18 @@ system_menu() {
  系统重启：$(reboot_required_state)
 ----------------------------------------
  1) 系统更新
- 2) 一键开启 BBR + fq
- 3) 安装 Fail2ban
- 4) 限制 systemd 日志大小
+ 2) 垃圾清理
+ 3) 限制 systemd 日志大小
+ 4) 一键开启 BBR + fq
  5) 修改系统 IPv4 DNS
  6) 启用系统 IPv4 优先
  7) 修改 SSH 端口
  8) SSH 基础加固
- 9) 查看 SSH 当前生效配置
+ 9) 安装 Fail2ban
  10) 开启 NTP 时间同步
- 11) 查看/恢复 VPSBox 系统改动
- 12) 垃圾清理
- 13) 修改主机名
+ 11) 查看 SSH 当前生效配置
+ 12) 修改主机名
+ 13) 查看/恢复 VPSBox 系统改动
  0) 返回主菜单
 ========================================
 EOF
@@ -4891,18 +4892,18 @@ EOF
 
         case "$opt" in
             1) run_menu_action update_system_packages; pause ;;
-            2) run_menu_action enable_bbr_fq; pause ;;
-            3) run_menu_action install_fail2ban; pause ;;
-            4) run_menu_action limit_systemd_journal; pause ;;
+            2) run_menu_action cleanup_system_garbage; pause ;;
+            3) run_menu_action limit_systemd_journal; pause ;;
+            4) run_menu_action enable_bbr_fq; pause ;;
             5) run_menu_action change_ipv4_dns; pause ;;
             6) run_menu_action enable_ipv4_priority; pause ;;
             7) ssh_port_change_menu ;;
             8) ssh_basic_hardening_menu ;;
-            9) run_menu_action show_current_ssh_config; pause ;;
+            9) run_menu_action install_fail2ban; pause ;;
             10) run_menu_action enable_ntp_sync; pause ;;
-            11) run_menu_action restore_vpsbox_system_changes; pause ;;
-            12) run_menu_action cleanup_system_garbage; pause ;;
-            13) run_menu_action change_system_hostname; pause ;;
+            11) run_menu_action show_current_ssh_config; pause ;;
+            12) run_menu_action change_system_hostname; pause ;;
+            13) run_menu_action restore_vpsbox_system_changes; pause ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
