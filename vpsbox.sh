@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="VPSBox"
-VPSBOX_VERSION="v1.0.9"
+VPSBOX_VERSION="v1.0.10"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
@@ -547,9 +547,21 @@ check_vpsbox_update_on_start() {
     fi
 }
 
+auto_update_vpsbox_on_start() {
+    [ "$UPDATE_AVAILABLE" -eq 1 ] || return 0
+
+    info "发现新版本 $REMOTE_VERSION，正在自动更新..."
+    if update_vpsbox; then
+        return 0
+    fi
+
+    warn "自动更新失败，继续使用当前版本；可稍后使用菜单 8 重试。"
+    return 0
+}
+
 vpsbox_update_notice() {
     if [ "$UPDATE_AVAILABLE" -eq 1 ]; then
-        printf ' 新版本：%s（请使用菜单 8 手动更新）\n' "$REMOTE_VERSION"
+        printf ' 新版本：%s（自动更新失败，请使用菜单 8 重试）\n' "$REMOTE_VERSION"
     fi
 }
 
@@ -2294,6 +2306,7 @@ update_singbox() {
 
 update_vpsbox() {
     local backup="${CMD_PATH}.previous"
+    local status
 
     info "正在下载最新 vpsbox 脚本..."
     if [ -f "$CMD_PATH" ]; then
@@ -2309,7 +2322,13 @@ update_vpsbox() {
 
     info "vpsbox 已更新；旧版本备份：$backup"
     info "正在重新打开新版管理面板..."
-    exec "$CMD_PATH"
+    cleanup_vpsbox_lock
+    exec "$CMD_PATH" || {
+        status=$?
+        err "无法重新打开新版管理面板，正在恢复当前菜单运行锁。"
+        acquire_lock
+        return "$status"
+    }
 }
 
 bbr_state() {
@@ -5121,6 +5140,7 @@ $(ipv4_dns_lines)
  3) 系统优化
  4) 一键自检
  5) 查看三网回程
+ 6) 其他脚本
 ----------------------------------------
  8) 更新 vpsbox 脚本
  9) 卸载 VPSBox
@@ -5255,6 +5275,51 @@ EOF
     done
 }
 
+show_ip_quality_script_info() {
+    clear 2>/dev/null || true
+    cat <<'EOF'
+========================================
+ IP 质量体检脚本
+========================================
+ 项目地址：
+ https://github.com/xykt/ScriptMenu
+
+ 上游命令：
+ bash <(curl -Ls https://Check.Place) -I
+
+ 说明：VPSBox 仅提供第三方脚本链接和命令提示，
+ 不会自动执行。
+========================================
+EOF
+}
+
+other_scripts_menu() {
+    local opt
+
+    while true; do
+        clear 2>/dev/null || true
+        cat <<'EOF'
+========================================
+ 其他脚本
+========================================
+ 1) IP 质量体检脚本
+ 0) 返回主菜单
+========================================
+EOF
+        read -r -p "请输入选项: " opt || exit 0
+        echo ""
+
+        case "$opt" in
+            1)
+                show_ip_quality_script_info
+                exit 0
+                ;;
+            0) return 0 ;;
+            *) warn "无效选项：$opt"; pause ;;
+        esac
+    done
+}
+
 main_loop() {
     while true; do
         show_menu
@@ -5267,6 +5332,7 @@ main_loop() {
             3) run_menu_action system_menu ;;
             4) run_menu_action run_self_check; pause ;;
             5) run_menu_action show_backtrace_routes; pause ;;
+            6) run_menu_action other_scripts_menu ;;
             8) update_vpsbox; pause ;;
             9) uninstall_all; pause ;;
             0) exit 0 ;;
@@ -5280,4 +5346,5 @@ detect_os
 acquire_lock
 install_self_command
 check_vpsbox_update_on_start
+auto_update_vpsbox_on_start
 main_loop
