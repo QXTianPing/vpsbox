@@ -3,10 +3,11 @@ set -euo pipefail
 umask 077
 
 APP_NAME="VPSBox"
-VPSBOX_VERSION="v1.0.5"
+VPSBOX_VERSION="v1.0.6"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
+DEFAULT_REALITY_SERVER_NAME="addons.mozilla.org"
 CMD_PATH="/usr/local/bin/vpsbox"
 CONFIG_DIR="/etc/sing-box"
 CONFIG_PATH="$CONFIG_DIR/config.json"
@@ -2059,8 +2060,8 @@ create_vless_reality_node() {
     done
 
     while true; do
-        read -r -p "请输入 Reality 目标域名/SNI：" input_sni || { cleanup_node_backup "$backup_dir"; info "输入已结束，已取消。"; return 1; }
-        server_name="$(normalize_host "$input_sni")"
+        read -r -p "请输入 Reality 目标域名/SNI（留空默认 ${DEFAULT_REALITY_SERVER_NAME}）：" input_sni || { cleanup_node_backup "$backup_dir"; info "输入已结束，已取消。"; return 1; }
+        server_name="$(normalize_host "${input_sni:-$DEFAULT_REALITY_SERVER_NAME}")"
         if ! is_domain_name "$server_name"; then
             err "Reality 目标必须是有效域名，不能使用 IP 地址。"
             continue

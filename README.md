@@ -2,7 +2,7 @@
 
 VPS 初始化、系统优化与 sing-box 节点管理脚本。
 
-当前版本：`v1.0.5`
+当前版本：`v1.0.6`
 
 ## VPS 一键安装
 
@@ -89,7 +89,7 @@ sing-box 管理
 
 - 自动检查并安装 sing-box
 - 创建/重建 SS 2022 节点（可手动指定端口，留空自动随机）
-- 创建/重建 VLESS Reality 节点（分别输入客户端连接地址与 Reality 目标域名/SNI）
+- 创建/重建 VLESS Reality 节点（分别输入客户端连接地址与 Reality 目标域名/SNI；SNI 留空默认 `addons.mozilla.org`）
 - 校验节点域名/IP 格式
 - 随机端口
 - 随机强密码
