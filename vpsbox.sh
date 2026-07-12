@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="VPSBox"
-VPSBOX_VERSION="v1.0.4"
+VPSBOX_VERSION="v1.0.5"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
@@ -4459,14 +4459,18 @@ uninstall_all() {
     read -r -p "确认卸载 VPSBox？请输入 YES：" confirm
     [ "$confirm" = "YES" ] || { info "已取消。"; return 0; }
 
-    read -r -p "是否同时删除 sing-box 和所有节点配置？请输入 YES 确认：" remove_singbox
-    if [ "$remove_singbox" = "YES" ]; then
-        uninstall_singbox_and_nodes || {
-            err "sing-box 卸载未完成，已保留 VPSBox 管理命令便于重试。"
-            return 1
-        }
+    if ! singbox_installed; then
+        info "未安装 sing-box，无需删除节点配置。"
     else
-        info "已保留 sing-box 和节点配置。"
+        read -r -p "是否同时删除 sing-box 和所有节点配置？请输入 YES 确认：" remove_singbox
+        if [ "$remove_singbox" = "YES" ]; then
+            uninstall_singbox_and_nodes || {
+                err "sing-box 卸载未完成，已保留 VPSBox 管理命令便于重试。"
+                return 1
+            }
+        else
+            info "已保留 sing-box 和节点配置。"
+        fi
     fi
 
     info "正在删除 VPSBox 命令..."
