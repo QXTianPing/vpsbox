@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.13"
+VPSBOX_VERSION="v1.0.14"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
@@ -5587,6 +5587,79 @@ show_ip_quality_script_info() {
 EOF
 }
 
+show_network_quality_script_info() {
+    clear 2>/dev/null || true
+    cat <<'EOF'
+========================================
+ 网络质量体检脚本
+========================================
+ 项目地址：
+ https://github.com/xykt/ScriptMenu
+
+ 上游命令：
+ bash <(curl -Ls https://Check.Place) -N
+
+ 说明：vpsbox 仅提供第三方脚本链接和命令提示，
+ 不会自动执行。
+========================================
+EOF
+}
+
+show_tcp_quality_script_info() {
+    clear 2>/dev/null || true
+    cat <<'EOF'
+========================================
+ TCP 质量检测脚本
+========================================
+ 项目地址：
+ https://github.com/ibsgss/TcpQuality
+
+ 上游命令：
+ bash <(curl -fsSL https://raw.githubusercontent.com/ibsgss/TcpQuality/main/runTcpQuality.sh)
+
+ 说明：vpsbox 仅提供第三方脚本链接和命令提示，
+ 不会自动执行。
+========================================
+EOF
+}
+
+show_node_quality_script_info() {
+    clear 2>/dev/null || true
+    cat <<'EOF'
+========================================
+ VPS 综合质量测试脚本
+========================================
+ 项目地址：
+ https://github.com/LloydAsp/NodeQuality
+
+ 上游命令：
+ bash <(curl -sL https://run.NodeQuality.com)
+
+ 说明：vpsbox 仅提供第三方脚本链接和命令提示，
+ 不会自动执行。
+========================================
+EOF
+}
+
+show_reinstall_script_info() {
+    clear 2>/dev/null || true
+    cat <<'EOF'
+========================================
+ 一键 VPS 系统重装脚本
+========================================
+ 项目地址：
+ https://github.com/bin456789/reinstall
+
+ 上游命令（安装 Debian 13）：
+ curl -fL https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh -o reinstall.sh && bash reinstall.sh debian 13
+
+ 警告：执行重装会清除整个系统盘的数据。
+ vpsbox 仅提供第三方脚本链接和命令提示，
+ 不会自动执行。
+========================================
+EOF
+}
+
 other_scripts_menu() {
     local opt
 
@@ -5596,7 +5669,11 @@ other_scripts_menu() {
 ========================================
  其他脚本
 ========================================
- [1] IP 质量体检脚本
+ [1] IP 质量体检脚本（xykt）
+ [2] 网络质量体检脚本（xykt）
+ [3] TCP 质量检测脚本（ibsgss）
+ [4] VPS 综合质量测试脚本（LloydAsp）
+ [5] 一键 VPS 系统重装脚本（bin456789）
  [0] 返回主菜单
 ========================================
 EOF
@@ -5606,6 +5683,22 @@ EOF
         case "$opt" in
             1)
                 show_ip_quality_script_info
+                exit 0
+                ;;
+            2)
+                show_network_quality_script_info
+                exit 0
+                ;;
+            3)
+                show_tcp_quality_script_info
+                exit 0
+                ;;
+            4)
+                show_node_quality_script_info
+                exit 0
+                ;;
+            5)
+                show_reinstall_script_info
                 exit 0
                 ;;
             0) return 0 ;;
