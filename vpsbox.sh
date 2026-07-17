@@ -3,10 +3,10 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.26"
-# 用户名迁移完成后使用新地址；旧地址仅作为迁移回退，并用于识别 v1.0.23 备份。
+VPSBOX_VERSION="v1.0.27"
+# 只从当前仓库下载可执行脚本；旧地址仅用于识别本地 v1.0.23 及更早备份，绝不联网获取。
 SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
-SCRIPT_URL_FALLBACK="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
+LEGACY_SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
 DEFAULT_REALITY_SERVER_NAME="addons.mozilla.org"
@@ -67,6 +67,8 @@ ACTIVE_FAIL2BAN_TEST_BACKENDS=""
 ACTIVE_SINGBOX_UPDATE_BINARY=""
 ACTIVE_SINGBOX_UPDATE_BACKUP=""
 ACTIVE_SINGBOX_UPDATE_DIR=""
+ACTIVE_SINGBOX_UPDATE_PACKAGE=""
+ACTIVE_SINGBOX_UPDATE_OLD_VERSION=""
 ACTIVE_SINGBOX_UPDATE_WAS_ENABLED=0
 ACTIVE_SINGBOX_UPDATE_WAS_ACTIVE=0
 ACTIVE_SINGBOX_UPDATE_MUTATED=0
@@ -888,8 +890,8 @@ vpsbox_script_identity_valid() {
 
     [ -f "$script" ] && [ ! -L "$script" ] || return 1
     grep -Fqx 'APP_NAME="vpsbox"' "$script" || return 1
-    if ! grep -Fqx 'SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"' "$script" &&
-        ! grep -Fqx 'SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"' "$script"; then
+    if ! grep -Fqx "SCRIPT_URL=\"$LEGACY_SCRIPT_URL\"" "$script" &&
+        ! grep -Fqx "SCRIPT_URL=\"$SCRIPT_URL\"" "$script"; then
         return 1
     fi
     grep -Fqx 'vpsbox_main() {' "$script" || return 1
@@ -906,9 +908,7 @@ fetch_vpsbox_script_once() {
         return 0
     fi
     rm -f -- "$dest"
-    [ "$SCRIPT_URL_FALLBACK" != "$SCRIPT_URL" ] || return 1
-    curl -fsSL --connect-timeout "$connect_timeout" --max-time "$max_time" \
-        "$SCRIPT_URL_FALLBACK" -o "$dest"
+    return 1
 }
 
 download_vpsbox_script() {
@@ -929,7 +929,7 @@ download_vpsbox_script() {
 
     if ! retry 3 2 fetch_vpsbox_script_once "$tmp" 8 180; then
         rm -f "$tmp"
-        err "新旧 GitHub Raw 地址均下载失败，请检查网络后重试。"
+        err "GitHub Raw 下载失败，请检查网络后重试。"
         return 1
     fi
 
@@ -1145,6 +1145,69 @@ run_singbox_installer() {
     return 0
 }
 
+singbox_binary_is_package_managed() {
+    local binary_path="$1" owner
+
+    binary_path="$(readlink -f -- "$binary_path" 2>/dev/null || printf '%s' "$binary_path")"
+    detect_os
+    case "$OS" in
+        debian)
+            command -v dpkg-query >/dev/null 2>&1 || return 1
+            owner="$(dpkg-query -S "$binary_path" 2>/dev/null | awk -F: 'NR == 1 { print $1 }')"
+            [[ "$owner" =~ ^sing-box(:[^:]+)?$ ]]
+            ;;
+        alpine)
+            command -v apk >/dev/null 2>&1 || return 1
+            apk info --who-owns "$binary_path" 2>/dev/null | grep -Eq ' owned by sing-box-[^[:space:]]+$'
+            ;;
+        redhat)
+            command -v rpm >/dev/null 2>&1 || return 1
+            [ "$(rpm -qf --queryformat '%{NAME}\n' "$binary_path" 2>/dev/null || true)" = "sing-box" ]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+prepare_singbox_rollback_package() {
+    local version="$1" backup_dir="$2"
+    local arch suffix asset package
+
+    [[ "$version" =~ ^[0-9]+([.][0-9]+){2}$ ]] || return 1
+    detect_os
+    case "$OS" in
+        debian) arch="$(dpkg --print-architecture)"; suffix="deb" ;;
+        alpine) arch="$(apk --print-arch)"; suffix="apk" ;;
+        redhat) arch="$(uname -m)"; suffix="rpm" ;;
+        *) return 1 ;;
+    esac
+    asset="sing-box_${version}_linux_${arch}.${suffix}"
+    package="$backup_dir/$asset"
+    download_verified_github_asset "SagerNet/sing-box" "v$version" "$asset" "$package" || return 1
+    printf '%s\n' "$package"
+}
+
+install_singbox_package_file() {
+    local package="$1"
+
+    [ -f "$package" ] && [ ! -L "$package" ] || return 1
+    detect_os
+    case "$OS" in
+        debian)
+            run_bounded_command "$PACKAGE_INSTALL_TIMEOUT" \
+                env DEBIAN_FRONTEND=noninteractive \
+                dpkg --force-confdef --force-confold --install "$package"
+            ;;
+        alpine)
+            apk_bounded "$PACKAGE_INSTALL_TIMEOUT" add --allow-untrusted "$package"
+            ;;
+        redhat)
+            run_bounded_command "$PACKAGE_INSTALL_TIMEOUT" \
+                rpm -Uvh --oldpackage --replacepkgs "$package"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 install_self_command() {
     local src
     src="${1:-${BASH_SOURCE[0]:-$0}}"
@@ -1263,7 +1326,31 @@ backup_change_file_once() {
 }
 
 mark_change_applied() {
-    manifest_set "APPLIED_$1" 1
+    local name="$1"
+
+    manifest_set "APPLIED_$name" 1 || return 1
+    manifest_remove "PENDING_$name"
+}
+
+begin_change_transaction() {
+    manifest_set "PENDING_$1" 1
+}
+
+change_restore_state() {
+    local name="$1"
+
+    if [ "$(manifest_value "PENDING_$name" 2>/dev/null || true)" = "1" ]; then
+        printf '%s\n' pending
+    # 兼容 v1.0.26 及更早版本的变更清单：旧版本只记录 APPLIED，没有 PENDING。
+    elif [ "$(manifest_value "APPLIED_$name" 2>/dev/null || true)" = "1" ]; then
+        printf '%s\n' applied
+    else
+        printf '%s\n' none
+    fi
+}
+
+change_needs_restore() {
+    [ "$(change_restore_state "$1")" != none ]
 }
 
 restore_change_file() {
@@ -1315,6 +1402,7 @@ clear_change_tracking() {
     rm -f "$CHANGE_BACKUP_DIR/$name" || failed=1
     manifest_remove "BACKUP_$name" || failed=1
     manifest_remove "APPLIED_$name" || failed=1
+    manifest_remove "PENDING_$name" || failed=1
     return "$failed"
 }
 
@@ -3151,7 +3239,8 @@ delete_node() {
 restore_singbox_update_backup() {
     local binary_path="$1" backup_binary="$2" backup_dir="$3"
     local was_enabled="$4" was_active="$5"
-    local failed=0
+    local rollback_package="${6:-}" old_version="${7:-}"
+    local failed=0 package_restored=0 binary_ready=0 service_ready=1
 
     if ! service_stop 2>/dev/null && service_manager_is_active; then
         err "更新后的 sing-box 服务无法停止，已拒绝在运行中覆盖二进制。"
@@ -3165,16 +3254,31 @@ restore_singbox_update_backup() {
         warn "sing-box 更新备份已保留：$backup_dir"
         return 1
     fi
-    if ! cp -a -- "$backup_binary" "$binary_path"; then
-        err "旧 sing-box 二进制恢复失败：$backup_binary"
-        failed=1
+    if [ -n "$rollback_package" ] && [ -n "$old_version" ]; then
+        if install_singbox_package_file "$rollback_package" &&
+            [ "$(singbox_version)" = "$old_version" ]; then
+            package_restored=1
+            binary_ready=1
+        else
+            err "旧 sing-box 软件包恢复失败，正在尝试恢复二进制副本。"
+            failed=1
+        fi
+    fi
+    if [ "$package_restored" -eq 0 ]; then
+        if cp -a -- "$backup_binary" "$binary_path"; then
+            binary_ready=1
+        else
+            err "旧 sing-box 二进制恢复失败：$backup_binary"
+            failed=1
+        fi
     fi
     hash -r
-    if [ "$failed" -eq 0 ] && node_exists && ! setup_service; then
+    if [ "$binary_ready" -eq 1 ] && node_exists && ! setup_service; then
         err "旧 sing-box 服务配置恢复失败。"
         failed=1
+        service_ready=0
     fi
-    if [ "$failed" -eq 0 ] &&
+    if [ "$binary_ready" -eq 1 ] && [ "$service_ready" -eq 1 ] &&
         ! restore_singbox_service_state "$was_enabled" "$was_active"; then
         err "旧 sing-box 二进制已恢复，但原服务状态恢复失败。"
         failed=1
@@ -3189,6 +3293,8 @@ begin_singbox_update_transaction() {
     ACTIVE_SINGBOX_UPDATE_BINARY="$1"
     ACTIVE_SINGBOX_UPDATE_BACKUP="$2"
     ACTIVE_SINGBOX_UPDATE_DIR="$3"
+    ACTIVE_SINGBOX_UPDATE_PACKAGE="${6:-}"
+    ACTIVE_SINGBOX_UPDATE_OLD_VERSION="${7:-}"
     ACTIVE_SINGBOX_UPDATE_WAS_ENABLED="$4"
     ACTIVE_SINGBOX_UPDATE_WAS_ACTIVE="$5"
     ACTIVE_SINGBOX_UPDATE_MUTATED=0
@@ -3200,6 +3306,8 @@ cancel_unmodified_singbox_update_transaction() {
     ACTIVE_SINGBOX_UPDATE_BINARY=""
     ACTIVE_SINGBOX_UPDATE_BACKUP=""
     ACTIVE_SINGBOX_UPDATE_DIR=""
+    ACTIVE_SINGBOX_UPDATE_PACKAGE=""
+    ACTIVE_SINGBOX_UPDATE_OLD_VERSION=""
     ACTIVE_SINGBOX_UPDATE_WAS_ENABLED=0
     ACTIVE_SINGBOX_UPDATE_WAS_ACTIVE=0
     ACTIVE_SINGBOX_UPDATE_MUTATED=0
@@ -3211,13 +3319,16 @@ cancel_unmodified_singbox_update_transaction() {
 }
 
 rollback_active_singbox_update() {
-    local binary_path backup_binary backup_dir was_enabled was_active mutated result=0
+    local binary_path backup_binary backup_dir rollback_package old_version
+    local was_enabled was_active mutated result=0
 
     [ "${ACTIVE_SINGBOX_UPDATE_ROLLING_BACK:-0}" = "0" ] || return 0
     backup_dir="${ACTIVE_SINGBOX_UPDATE_DIR:-}"
     [ -n "$backup_dir" ] || return 0
     binary_path="$ACTIVE_SINGBOX_UPDATE_BINARY"
     backup_binary="$ACTIVE_SINGBOX_UPDATE_BACKUP"
+    rollback_package="$ACTIVE_SINGBOX_UPDATE_PACKAGE"
+    old_version="$ACTIVE_SINGBOX_UPDATE_OLD_VERSION"
     was_enabled="$ACTIVE_SINGBOX_UPDATE_WAS_ENABLED"
     was_active="$ACTIVE_SINGBOX_UPDATE_WAS_ACTIVE"
     mutated="$ACTIVE_SINGBOX_UPDATE_MUTATED"
@@ -3227,12 +3338,15 @@ rollback_active_singbox_update() {
     ACTIVE_SINGBOX_UPDATE_BINARY=""
     ACTIVE_SINGBOX_UPDATE_BACKUP=""
     ACTIVE_SINGBOX_UPDATE_DIR=""
+    ACTIVE_SINGBOX_UPDATE_PACKAGE=""
+    ACTIVE_SINGBOX_UPDATE_OLD_VERSION=""
     ACTIVE_SINGBOX_UPDATE_WAS_ENABLED=0
     ACTIVE_SINGBOX_UPDATE_WAS_ACTIVE=0
     ACTIVE_SINGBOX_UPDATE_MUTATED=0
     if [ "$mutated" = "1" ]; then
         restore_singbox_update_backup \
-            "$binary_path" "$backup_binary" "$backup_dir" "$was_enabled" "$was_active" || result=1
+            "$binary_path" "$backup_binary" "$backup_dir" "$was_enabled" "$was_active" \
+            "$rollback_package" "$old_version" || result=1
     elif { [[ "$backup_dir" == /tmp/vpsbox-sing-box-update.* ]] ||
         [ "${VPSBOX_TEST_MODE:-0}" = "1" ]; } &&
         [ -d "$backup_dir" ] && [ ! -L "$backup_dir" ]; then
@@ -3250,6 +3364,8 @@ commit_singbox_update_transaction() {
     ACTIVE_SINGBOX_UPDATE_BINARY=""
     ACTIVE_SINGBOX_UPDATE_BACKUP=""
     ACTIVE_SINGBOX_UPDATE_DIR=""
+    ACTIVE_SINGBOX_UPDATE_PACKAGE=""
+    ACTIVE_SINGBOX_UPDATE_OLD_VERSION=""
     ACTIVE_SINGBOX_UPDATE_WAS_ENABLED=0
     ACTIVE_SINGBOX_UPDATE_WAS_ACTIVE=0
     ACTIVE_SINGBOX_UPDATE_MUTATED=0
@@ -3260,7 +3376,7 @@ commit_singbox_update_transaction() {
 }
 
 update_singbox() {
-    local binary_path backup_dir backup_binary old_version
+    local binary_path backup_dir backup_binary rollback_package old_version
     local relation new_version
     local was_active=0 was_enabled=0
 
@@ -3288,6 +3404,11 @@ update_singbox() {
             ;;
         newer) ;;
     esac
+    if ! singbox_binary_is_package_managed "$binary_path"; then
+        err "当前 sing-box 不是由系统 sing-box 软件包管理，已拒绝自动更新。"
+        info "请先用原安装方式更新或卸载，再由 vpsbox 安装受管版本。"
+        return 1
+    fi
     backup_dir="$(mktemp -d /tmp/vpsbox-sing-box-update.XXXXXX)" || return 1
     backup_binary="$backup_dir/sing-box"
     cp -a "$binary_path" "$backup_binary" || { rm -rf "$backup_dir"; err "备份当前 sing-box 二进制失败，已取消更新。"; return 1; }
@@ -3306,6 +3427,13 @@ update_singbox() {
         err "更新依赖准备失败；sing-box 二进制和服务状态均未修改。"
         return 1
     fi
+    rollback_package="$(prepare_singbox_rollback_package "$old_version" "$backup_dir")" || {
+        cancel_unmodified_singbox_update_transaction
+        err "无法下载并校验旧版 sing-box 回滚包，已取消更新。"
+        return 1
+    }
+    ACTIVE_SINGBOX_UPDATE_PACKAGE="$rollback_package"
+    ACTIVE_SINGBOX_UPDATE_OLD_VERSION="$old_version"
     info "正在更新 sing-box..."
     ACTIVE_SINGBOX_UPDATE_MUTATED=1
     if ! run_singbox_installer; then
@@ -4813,6 +4941,7 @@ write_resolv_conf_dns() {
     else
         created_resolv="1"
     fi
+    begin_change_transaction DNS_RESOLV || { err "记录 DNS 修改事务失败，已取消修改。"; return 1; }
 
     tmp="$(mktemp /etc/.resolv.conf.vpsbox.XXXXXX)" || return 1
     if ! {
@@ -4899,6 +5028,7 @@ write_systemd_resolved_dns() {
     else
         created_conf="1"
     fi
+    begin_change_transaction DNS_RESOLVED || { err "记录 DNS 修改事务失败，已取消修改。"; return 1; }
 
     tmp="$(mktemp "$conf_dir/.vpsbox.conf.XXXXXX")" || return 1
     if ! cat > "$tmp" <<EOF
@@ -5026,25 +5156,43 @@ EOF
 }
 
 enable_ipv4_priority() {
+    local parent tmp
+
     info "正在启用系统 IPv4 优先，不会禁用 IPv6。"
     if [ "$(ipv4_priority_state)" = "已启用" ]; then
         info "系统 IPv4 优先已启用，无需重复修改。"
         return 0
     fi
+    [ ! -L "$GAI_CONF" ] || { err "$GAI_CONF 是符号链接，已拒绝修改。"; return 1; }
     backup_change_file_once GAI_CONF "$GAI_CONF" || { err "记录 IPv4 优先原配置失败，已取消修改。"; return 1; }
+    begin_change_transaction GAI_CONF || { err "记录 IPv4 优先事务失败，已取消修改。"; return 1; }
 
-    if ! touch "$GAI_CONF"; then
-        err "无法创建或写入 $GAI_CONF。"
+    parent="$(dirname "$GAI_CONF")"
+    [ -d "$parent" ] && [ ! -L "$parent" ] || {
+        err "IPv4 优先配置目录无效或为符号链接：$parent"
         return 1
+    }
+    tmp="$(mktemp "$parent/.gai.conf.vpsbox.XXXXXX")" || return 1
+    if [ -f "$GAI_CONF" ]; then
+        cp -a -- "$GAI_CONF" "$tmp" || { rm -f -- "$tmp"; return 1; }
+    else
+        chmod 644 "$tmp" || { rm -f -- "$tmp"; return 1; }
     fi
 
-    if ! sed -i '/^[#[:space:]]*precedence[[:space:]]\+::ffff:0:0\/96[[:space:]]\+/d' "$GAI_CONF"; then
+    if ! sed -i '/^[#[:space:]]*precedence[[:space:]]\+::ffff:0:0\/96[[:space:]]\+/d' "$tmp"; then
+        rm -f -- "$tmp"
         err "清理旧 IPv4 优先配置失败。"
         return 1
     fi
 
-    if ! printf '%s\n' 'precedence ::ffff:0:0/96 100' >> "$GAI_CONF"; then
+    if ! printf '%s\n' 'precedence ::ffff:0:0/96 100' >> "$tmp"; then
+        rm -f -- "$tmp"
         err "写入 IPv4 优先配置失败。"
+        return 1
+    fi
+    if ! chown root:root "$tmp" || ! mv -f -- "$tmp" "$GAI_CONF"; then
+        rm -f -- "$tmp"
+        err "原子替换 IPv4 优先配置失败。"
         return 1
     fi
 
@@ -5740,6 +5888,7 @@ sync_fail2ban_sshd_port() {
         backup="${FAIL2BAN_VPSBOX_SSHD_CONF}.bak.$(date +%Y%m%d%H%M%S)"
         cp -a "$FAIL2BAN_VPSBOX_SSHD_CONF" "$backup" || return 1
     fi
+    begin_change_transaction FAIL2BAN_SSHD || { err "记录 Fail2ban 修改事务失败，已取消修改。"; return 1; }
 
     tmp="$(mktemp "$FAIL2BAN_CONFIG_DIR/.vpsbox-sshd.XXXXXX")" || return 1
     cat > "$tmp" <<EOF
@@ -6479,6 +6628,7 @@ enable_bbr_fq() {
         cp -a "$BBR_CONF" "$backup_dir/99-vpsbox-bbr.conf" || { rm -rf "$backup_dir"; err "备份 BBR 配置失败。"; return 1; }
         had_old_conf=1
     fi
+    begin_change_transaction BBR_CONF || { rm -rf "$backup_dir"; err "记录 BBR 修改事务失败，已取消修改。"; return 1; }
     tmp="$(mktemp /etc/sysctl.d/.vpsbox-bbr.XXXXXX)" || { rm -rf "$backup_dir"; return 1; }
     cat > "$tmp" <<EOF
 net.core.default_qdisc=fq
@@ -7460,6 +7610,9 @@ firewall_detect_docker_ports() {
                     return 1
                     ;;
             esac
+            if [ -n "$host_ip" ]; then
+                firewall_record_docker_public_binding "$protocol" "$host_ip" "$host_port" || return 1
+            fi
         done <<< "$bindings"
 
         running="$(docker_with_timeout inspect --format '{{.State.Running}}' "$container" 2>/dev/null)" || {
@@ -10245,9 +10398,14 @@ uninstall_all() {
 
     echo "此操作会卸载 vpsbox 管理命令。"
     echo "默认不会删除 sing-box，也不会删除节点配置。"
-    echo "可在确认后恢复 vpsbox 已记录的 DNS、BBR、Fail2ban、NTP、journald 与 IPv4 优先设置。"
+    echo "如有已记录的系统设置，卸载前可选择恢复。"
     read -r -p "确认卸载 vpsbox？请输入 YES：" confirm
     [ "$confirm" = "YES" ] || { info "已取消。"; return 0; }
+
+    offer_restore_recorded_changes_before_uninstall || {
+        err "系统设置恢复未完成，已取消卸载并保留 vpsbox 管理命令。"
+        return 1
+    }
 
     if firewall_artifacts_present; then
         echo "检测到由 vpsbox 管理的主机防火墙。"
@@ -10361,6 +10519,7 @@ change_system_hostname() {
     manifest_set_once HOSTNAME_VALUE "$old" || return 1
     original="$(manifest_value HOSTNAME_VALUE 2>/dev/null || true)"
     [ -n "$original" ] || { err "无法记录原始主机名，已取消修改。"; return 1; }
+    begin_change_transaction HOSTNAME || { err "记录主机名修改事务失败，已取消修改。"; return 1; }
     short_name="$(hostname_short_name "$new")"
     hosts_entry="127.0.1.1 $new"
     [ "$short_name" = "$new" ] || hosts_entry+=" $short_name"
@@ -10523,45 +10682,75 @@ cleanup_system_garbage() {
 }
 
 show_vpsbox_changes() {
-    local name found=0
+    local name state found=0
     echo "vpsbox 已记录的系统变更："
     for name in HOSTNAME DNS_RESOLV DNS_RESOLVED BBR_CONF GAI_CONF FAIL2BAN_SSHD NTP_CONF JOURNALD_CONF; do
-        if [ "$(manifest_value "APPLIED_$name" 2>/dev/null || true)" = "1" ]; then
-            printf ' - %s：可恢复\n' "$name"
-            found=1
-        fi
+        state="$(change_restore_state "$name")"
+        case "$state" in
+            pending) printf ' - %s：未完成，可恢复\n' "$name"; found=1 ;;
+            applied) printf ' - %s：可恢复\n' "$name"; found=1 ;;
+        esac
     done
     [ "$found" -eq 1 ] || echo " - 无"
     echo "SSH 配置不会由此功能自动恢复，请保持当前连接并手动核验后处理。"
 }
 
+recorded_system_changes_present() {
+    local name
+
+    for name in HOSTNAME DNS_RESOLV DNS_RESOLVED BBR_CONF GAI_CONF FAIL2BAN_SSHD NTP_CONF JOURNALD_CONF; do
+        change_needs_restore "$name" && return 0
+    done
+    return 1
+}
+
+offer_restore_recorded_changes_before_uninstall() {
+    local confirm
+
+    recorded_system_changes_present || return 0
+    echo "检测到 vpsbox 已记录且可恢复的系统设置："
+    show_vpsbox_changes
+    if ! read -r -p "是否在卸载前恢复上述系统设置？请输入 YES 恢复，其他输入保留现状：" confirm; then
+        err "未能读取恢复选择，已取消卸载。"
+        return 1
+    fi
+    if [ "$confirm" = "YES" ]; then
+        restore_vpsbox_system_changes 1
+    else
+        info "已保留当前系统设置。"
+    fi
+}
+
 restore_vpsbox_system_changes() {
+    local skip_confirmation="${1:-0}"
     local confirm cc fq old failed=0
     local fail2ban_active fail2ban_enabled
 
-    show_vpsbox_changes
-    read -r -p "恢复上述 vpsbox 已记录的系统设置？请输入 YES：" confirm
-    [ "$confirm" = "YES" ] || { info "已取消恢复。"; return 0; }
+    if [ "$skip_confirmation" != "1" ]; then
+        show_vpsbox_changes
+        read -r -p "恢复上述 vpsbox 已记录的系统设置？请输入 YES：" confirm
+        [ "$confirm" = "YES" ] || { info "已取消恢复。"; return 0; }
+    fi
 
-    if [ "$(manifest_value APPLIED_HOSTNAME 2>/dev/null || true)" = "1" ]; then
+    if change_needs_restore HOSTNAME; then
         restore_change_file HOSTNAME_FILE /etc/hostname || failed=1
         restore_change_file HOSTS_FILE /etc/hosts || failed=1
         old="$(manifest_value HOSTNAME_VALUE 2>/dev/null || true)"
         [ -n "$old" ] && set_system_hostname "$old" 2>/dev/null || failed=1
     fi
 
-    if [ "$(manifest_value APPLIED_DNS_RESOLV 2>/dev/null || true)" = "1" ] && ! restore_change_file DNS_RESOLV /etc/resolv.conf; then failed=1; fi
-    if [ "$(manifest_value APPLIED_DNS_RESOLVED 2>/dev/null || true)" = "1" ] && ! restore_change_file DNS_RESOLVED /etc/systemd/resolved.conf.d/vpsbox.conf; then failed=1; fi
+    if change_needs_restore DNS_RESOLV && ! restore_change_file DNS_RESOLV /etc/resolv.conf; then failed=1; fi
+    if change_needs_restore DNS_RESOLVED && ! restore_change_file DNS_RESOLVED /etc/systemd/resolved.conf.d/vpsbox.conf; then failed=1; fi
     if resolv_conf_managed_by_systemd_resolved && ! systemctl restart systemd-resolved; then failed=1; fi
 
-    if [ "$(manifest_value APPLIED_BBR_CONF 2>/dev/null || true)" = "1" ]; then
+    if change_needs_restore BBR_CONF; then
         restore_change_file BBR_CONF "$BBR_CONF" || failed=1
         cc="$(manifest_value BBR_CC 2>/dev/null || true)"; fq="$(manifest_value BBR_FQ 2>/dev/null || true)"
         if [ -n "$cc" ] && [ "$cc" != "unknown" ]; then sysctl -w "net.ipv4.tcp_congestion_control=$cc" >/dev/null 2>&1 || failed=1; fi
         if [ -n "$fq" ] && [ "$fq" != "unknown" ]; then sysctl -w "net.core.default_qdisc=$fq" >/dev/null 2>&1 || failed=1; fi
     fi
-    if [ "$(manifest_value APPLIED_GAI_CONF 2>/dev/null || true)" = "1" ] && ! restore_change_file GAI_CONF "$GAI_CONF"; then failed=1; fi
-    if [ "$(manifest_value APPLIED_FAIL2BAN_SSHD 2>/dev/null || true)" = "1" ]; then
+    if change_needs_restore GAI_CONF && ! restore_change_file GAI_CONF "$GAI_CONF"; then failed=1; fi
+    if change_needs_restore FAIL2BAN_SSHD; then
         restore_change_file FAIL2BAN_SSHD "$FAIL2BAN_VPSBOX_SSHD_CONF" || failed=1
         if fail2ban_installed; then
             fail2ban-client -t -c /etc/fail2ban >/dev/null 2>&1 || failed=1
@@ -10578,11 +10767,11 @@ restore_vpsbox_system_changes() {
             fi
         fi
     fi
-    if [ "$(manifest_value APPLIED_JOURNALD_CONF 2>/dev/null || true)" = "1" ]; then
+    if change_needs_restore JOURNALD_CONF; then
         restore_change_file JOURNALD_CONF "$JOURNALD_VPSBOX_CONF" || failed=1
         is_systemd && systemctl restart systemd-journald && systemctl is-active --quiet systemd-journald || failed=1
     fi
-    if [ "$(manifest_value APPLIED_NTP_CONF 2>/dev/null || true)" = "1" ]; then
+    if change_needs_restore NTP_CONF; then
         if ! restore_recorded_ntp_change; then
             err "当前环境无法恢复 systemd 管理的 NTP 状态。"
             failed=1
@@ -10592,22 +10781,23 @@ restore_vpsbox_system_changes() {
         err "部分文件恢复失败；已保留变更清单和备份，请修复权限或路径后重试。"
         return 1
     fi
-    if [ "$(manifest_value APPLIED_HOSTNAME 2>/dev/null || true)" = "1" ]; then
+    if change_needs_restore HOSTNAME; then
         clear_change_tracking HOSTNAME_FILE || failed=1
         clear_change_tracking HOSTS_FILE || failed=1
         manifest_remove APPLIED_HOSTNAME || failed=1
+        manifest_remove PENDING_HOSTNAME || failed=1
         manifest_remove HOSTNAME_VALUE || failed=1
     fi
-    if [ "$(manifest_value APPLIED_BBR_CONF 2>/dev/null || true)" = "1" ]; then
+    if change_needs_restore BBR_CONF; then
         clear_change_tracking BBR_CONF || failed=1
         manifest_remove BBR_CC || failed=1
         manifest_remove BBR_FQ || failed=1
     fi
-    if [ "$(manifest_value APPLIED_NTP_CONF 2>/dev/null || true)" = "1" ]; then
+    if change_needs_restore NTP_CONF; then
         clear_ntp_change_tracking || failed=1
     fi
     for name in DNS_RESOLV DNS_RESOLVED GAI_CONF FAIL2BAN_SSHD JOURNALD_CONF; do
-        if [ "$(manifest_value "APPLIED_$name" 2>/dev/null || true)" = "1" ]; then
+        if change_needs_restore "$name"; then
             clear_change_tracking "$name" || failed=1
         fi
     done
@@ -10797,6 +10987,7 @@ limit_systemd_journal() {
         cp -a "$JOURNALD_VPSBOX_CONF" "$backup_dir/99-vpsbox.conf" || { rm -rf "$backup_dir"; err "备份 journald 配置失败。"; return 1; }
         had_old=1
     fi
+    begin_change_transaction JOURNALD_CONF || { rm -rf "$backup_dir"; err "记录 journald 修改事务失败，已取消修改。"; return 1; }
     tmp="$(mktemp "$conf_dir/.99-vpsbox.XXXXXX")" || { rm -rf "$backup_dir"; return 1; }
     cat > "$tmp" <<EOF
 [Journal]

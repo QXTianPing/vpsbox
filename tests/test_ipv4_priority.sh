@@ -76,13 +76,56 @@ test_absent_file_restores_to_absent() {
     [ ! -e "$GAI_CONF" ] || fail "恢复后应删除原本不存在的 gai.conf"
 }
 
+test_failed_atomic_replace_preserves_original_and_is_recoverable() {
+    local original="$TEST_TMP/atomic-original.conf"
+    local changes="$TEST_TMP/atomic-changes.out"
+
+    reset_case atomic-failure
+    printf '# original\nprecedence ::ffff:0:0/96 50\n' > "$GAI_CONF"
+    cp "$GAI_CONF" "$original"
+    mv() {
+        local last="${!#}"
+        if [ "$last" = "$GAI_CONF" ]; then
+            return 42
+        fi
+        command mv "$@"
+    }
+
+    if enable_ipv4_priority >"$TEST_TMP/atomic-enable.out" 2>&1; then
+        fail "最终原子替换失败时不应报告成功"
+    fi
+
+    cmp -s "$original" "$GAI_CONF" || fail "原子替换失败不得破坏原 gai.conf"
+    assert_file_contains "$CHANGE_MANIFEST" '^BACKUP_GAI_CONF=file$'
+    assert_file_contains "$CHANGE_MANIFEST" '^PENDING_GAI_CONF=1$'
+    assert_file_not_contains "$CHANGE_MANIFEST" '^APPLIED_GAI_CONF='
+    show_vpsbox_changes > "$changes"
+    assert_file_contains "$changes" 'GAI_CONF：未完成，可恢复'
+}
+
+test_symlink_target_is_rejected() {
+    local victim="$TEST_TMP/gai-victim.conf"
+
+    reset_case symlink
+    printf '%s\n' 'victim-content' > "$victim"
+    ln -s "$victim" "$GAI_CONF"
+
+    if enable_ipv4_priority >"$TEST_TMP/gai-symlink.out" 2>&1; then
+        fail "gai.conf 为符号链接时必须拒绝修改"
+    fi
+    assert_file_contains "$victim" '^victim-content$' "不得修改符号链接指向的文件"
+    [ ! -e "$CHANGE_MANIFEST" ] || fail "拒绝符号链接时不应创建变更事务"
+}
+
 main() {
     local name test status passed=0
-    local -a required=(enable_ipv4_priority ipv4_priority_state restore_change_file)
+    local -a required=(enable_ipv4_priority ipv4_priority_state restore_change_file show_vpsbox_changes)
     local -a tests=(
         test_repeated_enable_is_idempotent
         test_preconfigured_state_is_noop
         test_absent_file_restores_to_absent
+        test_failed_atomic_replace_preserves_original_and_is_recoverable
+        test_symlink_target_is_rejected
     )
 
     for name in "${required[@]}"; do

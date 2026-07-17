@@ -154,11 +154,11 @@ test_username_migration_identity_compatibility() {
     grep -Fqx -- 'SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"' \
         "$REPO_DIR/vpsbox.sh" ||
         fail "v1.0.24 必须使用 TianPingXi 作为主地址"
-    grep -Fqx -- 'SCRIPT_URL_FALLBACK="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"' \
+    grep -Fqx -- 'LEGACY_SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"' \
         "$REPO_DIR/vpsbox.sh" ||
-        fail "v1.0.24 必须保留旧地址作为迁移回退"
+        fail "必须只保留旧地址用于本地历史备份身份兼容"
 
-    write_fixture "$legacy" "$UPDATE_TEST_OLDER" legacy "$SCRIPT_URL_FALLBACK"
+    write_fixture "$legacy" "$UPDATE_TEST_OLDER" legacy "$LEGACY_SCRIPT_URL"
     vpsbox_script_identity_valid "$legacy" ||
         fail "v1.0.24 必须能识别并恢复 v1.0.23 旧地址备份"
 
@@ -220,47 +220,50 @@ test_vpsbox_newer_updates_once() {
     grep -Fqx -- "reexec:${CMD_PATH}.previous" "$MOCK_EVENT_LOG" ||
         fail "更新后重新执行必须携带本次 .previous 备份路径"
     assert_eq "$SCRIPT_URL" "$(cat "$MOCK_CURL_LOG")" \
-        "新地址可用时不应访问旧迁移回退地址"
+        "新地址可用时只应访问当前官方地址"
 }
 
-test_vpsbox_falls_back_to_old_owner_url() {
-    local expected_calls
+test_vpsbox_never_fetches_old_owner_url() {
+    local primary_count legacy_count
 
-    reset_update_case owner-fallback
-    write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed
-    write_fixture "$MOCK_REMOTE_SCRIPT" "$UPDATE_TEST_NEWER" remote
-    MOCK_CURL_FAIL_URLS="$SCRIPT_URL"
-
-    update_vpsbox >"$TEST_TMP/owner-fallback.out" 2>&1 ||
-        fail "新地址失败时应回退旧地址并完成更新"
-
-    assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_NEWER"
-    expected_calls="$(printf '%s\n%s' "$SCRIPT_URL" "$SCRIPT_URL_FALLBACK")"
-    assert_eq "$expected_calls" "$(cat "$MOCK_CURL_LOG")" \
-        "迁移地址回退顺序必须为新地址后旧地址"
-}
-
-test_all_owner_urls_fail_preserves_current() {
-    local primary_count fallback_count
-
-    reset_update_case all-owner-urls-fail
+    reset_update_case owner-failure
     write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed
     printf 'keep-backup\n' >"${CMD_PATH}.previous"
     write_fixture "$MOCK_REMOTE_SCRIPT" "$UPDATE_TEST_NEWER" remote
-    MOCK_CURL_FAIL_URLS="$(printf '%s\n%s' "$SCRIPT_URL" "$SCRIPT_URL_FALLBACK")"
+    MOCK_CURL_FAIL_URLS="$SCRIPT_URL"
     sleep() { :; }
 
-    if update_vpsbox >"$TEST_TMP/all-owner-urls-fail.out" 2>&1; then
-        fail "新旧地址都失败时更新必须报失败"
+    if update_vpsbox >"$TEST_TMP/owner-failure.out" 2>&1; then
+        fail "当前官方地址失败时更新必须失败"
+    fi
+
+    assert_file_contains "$CMD_PATH" 'installed'
+    assert_file_contains "${CMD_PATH}.previous" '^keep-backup$'
+    primary_count="$(grep -Fxc -- "$SCRIPT_URL" "$MOCK_CURL_LOG" || true)"
+    legacy_count="$(grep -Fxc -- "$LEGACY_SCRIPT_URL" "$MOCK_CURL_LOG" || true)"
+    assert_eq 3 "$primary_count" "应只重试当前官方地址"
+    assert_eq 0 "$legacy_count" "不得从可被重新注册的旧用户名下载脚本"
+}
+
+test_primary_url_failure_preserves_current() {
+    local primary_count
+
+    reset_update_case primary-url-fail
+    write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed
+    printf 'keep-backup\n' >"${CMD_PATH}.previous"
+    write_fixture "$MOCK_REMOTE_SCRIPT" "$UPDATE_TEST_NEWER" remote
+    MOCK_CURL_FAIL_URLS="$SCRIPT_URL"
+    sleep() { :; }
+
+    if update_vpsbox >"$TEST_TMP/primary-url-fail.out" 2>&1; then
+        fail "当前官方地址失败时更新必须报失败"
     fi
 
     assert_file_contains "$CMD_PATH" 'installed'
     assert_file_contains "${CMD_PATH}.previous" '^keep-backup$'
     assert_empty_file "$MOCK_EVENT_LOG" "下载失败不得触发替换后的副作用"
     primary_count="$(grep -Fxc -- "$SCRIPT_URL" "$MOCK_CURL_LOG" || true)"
-    fallback_count="$(grep -Fxc -- "$SCRIPT_URL_FALLBACK" "$MOCK_CURL_LOG" || true)"
     assert_eq 3 "$primary_count" "每轮都应尝试新主地址"
-    assert_eq 3 "$fallback_count" "每轮都应尝试旧回退地址"
 }
 
 test_vpsbox_invalid_download_preserves_current() {
@@ -305,7 +308,7 @@ EOF
 test_vpsbox_reexec_failure_restores_previous() {
     local output="$TEST_TMP/reexec-failure.out"
     reset_update_case reexec-failure
-    write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed "$SCRIPT_URL_FALLBACK"
+    write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed "$LEGACY_SCRIPT_URL"
     write_fixture "$MOCK_REMOTE_SCRIPT" "$UPDATE_TEST_NEWER" remote
     reexec_updated_vpsbox() {
         printf 'reexec-failed:%s\n' "${1:-}" >> "$MOCK_EVENT_LOG"
@@ -484,6 +487,12 @@ service_stop() { printf '%s\n' service-stop >> "$MOCK_SINGBOX_EVENT_LOG"; }
 stop_singbox_config_processes() { printf '%s\n' process-stop >> "$MOCK_SINGBOX_EVENT_LOG"; }
 node_exists() { return 1; }
 install_deps() { printf '%s\n' deps >> "$MOCK_SINGBOX_EVENT_LOG"; }
+singbox_binary_is_package_managed() { return 0; }
+prepare_singbox_rollback_package() {
+    local package="$2/sing-box-old.pkg"
+    : > "$package"
+    printf '%s\n' "$package"
+}
 run_singbox_installer() {
     printf 'installer:%s\n' "${1:-$SINGBOX_RELEASE_VERSION}" >> "$MOCK_SINGBOX_EVENT_LOG"
     MOCK_SINGBOX_VERSION="${1:-$SINGBOX_RELEASE_VERSION}"
@@ -532,8 +541,8 @@ main() {
         test_vpsbox_same_is_noop
         test_vpsbox_older_is_noop
         test_vpsbox_newer_updates_once
-        test_vpsbox_falls_back_to_old_owner_url
-        test_all_owner_urls_fail_preserves_current
+        test_vpsbox_never_fetches_old_owner_url
+        test_primary_url_failure_preserves_current
         test_vpsbox_invalid_download_preserves_current
         test_vpsbox_wrong_project_preserves_current
         test_vpsbox_reexec_failure_restores_previous

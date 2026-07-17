@@ -360,6 +360,7 @@ test_singbox_dependency_failure_does_not_touch_service() {
 
         singbox_installed() { return 0; }
         singbox_version() { printf '%s\n' 1.13.13; }
+        singbox_binary_is_package_managed() { return 0; }
         service_is_running() { return 0; }
         service_is_enabled() { return 0; }
         install_deps() {
@@ -399,10 +400,19 @@ test_failed_singbox_update_restores_binary_and_state() {
 
         singbox_installed() { return 0; }
         singbox_version() { printf '%s\n' 1.13.13; }
+        singbox_binary_is_package_managed() { return 0; }
         service_is_running() { return 0; }
         service_is_enabled() { return 0; }
         node_exists() { return 1; }
         install_deps() { return 0; }
+        prepare_singbox_rollback_package() {
+            local package="$2/sing-box-old.pkg"
+            : > "$package"
+            printf '%s\n' "$package"
+        }
+        install_singbox_package_file() {
+            cp "$update_backup/sing-box" "$fake_bin/sing-box"
+        }
         run_singbox_installer() {
             printf '%s\n' broken-new-binary > "$fake_bin/sing-box"
             return 1
@@ -431,6 +441,31 @@ test_failed_singbox_update_restores_binary_and_state() {
     )
 }
 
+test_external_singbox_update_is_rejected_before_mutation() {
+    (
+        local fake_bin="$TEST_TMP/singbox-external-bin"
+        local event_log="$TEST_TMP/singbox-external-events"
+        mkdir -p "$fake_bin"
+        printf '%s\n' external-binary > "$fake_bin/sing-box"
+        chmod 755 "$fake_bin/sing-box"
+        PATH="$fake_bin:$PATH"
+        : > "$event_log"
+
+        singbox_installed() { return 0; }
+        singbox_version() { printf '%s\n' 1.13.13; }
+        singbox_binary_is_package_managed() { return 1; }
+        install_deps() { printf '%s\n' deps >> "$event_log"; }
+        run_singbox_installer() { printf '%s\n' installer >> "$event_log"; }
+
+        if update_singbox >"$TEST_TMP/singbox-external.out" 2>&1; then
+            fail "非软件包管理的 sing-box 应拒绝自动更新"
+        fi
+        assert_file_contains "$fake_bin/sing-box" '^external-binary$'
+        assert_empty_file "$event_log" "拒绝外部安装时不得准备依赖或运行安装器"
+        assert_file_contains "$TEST_TMP/singbox-external.out" '不是由系统 sing-box 软件包管理'
+    )
+}
+
 main() {
     local test status passed=0
     local -a tests=(
@@ -454,6 +489,7 @@ main() {
         test_same_second_timestamp_is_not_after
         test_singbox_dependency_failure_does_not_touch_service
         test_failed_singbox_update_restores_binary_and_state
+        test_external_singbox_update_is_rejected_before_mutation
     )
 
     for test in "${tests[@]}"; do

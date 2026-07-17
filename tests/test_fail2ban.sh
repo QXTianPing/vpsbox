@@ -310,6 +310,7 @@ test_sync_validation_failure_rolls_back() {
     fail2ban_service_is_enabled() { return 0; }
     manifest_set_once() { return 0; }
     backup_change_file_once() { return 0; }
+    begin_change_transaction() { return 0; }
     ssh_effective_ports_csv() { printf '6384\n'; }
     is_systemd() { return 0; }
     systemctl() { printf '%s\n' "$*" >> "$systemctl_log"; }
@@ -337,6 +338,7 @@ test_sync_restores_initial_stopped_state() {
     fail2ban_service_is_enabled() { return 1; }
     manifest_set_once() { return 0; }
     backup_change_file_once() { return 0; }
+    begin_change_transaction() { return 0; }
     ssh_effective_ports_csv() { printf '2222\n'; }
     is_systemd() { return 0; }
     systemctl() {

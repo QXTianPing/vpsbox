@@ -288,6 +288,41 @@ EOF
     rm -rf -- "$snapshot"
 }
 
+test_stopped_docker_fixed_binding_is_public() {
+    (
+        docker() { :; }
+        firewall_docker_available() { return 0; }
+        firewall_validate_docker_daemon_mode() { return 0; }
+        firewall_detect_docker_proxy_ports() { return 0; }
+        firewall_docker_daemon_identity_unchanged() { return 0; }
+        docker_with_timeout() {
+            case "$*" in
+                "context show") printf '%s\n' default ;;
+                "context inspect --format {{.Endpoints.docker.Host}} default") printf '%s\n' unix:///var/run/docker.sock ;;
+                "info --format {{json .SecurityOptions}}") printf '%s\n' '[]' ;;
+                "info --format {{.Swarm.LocalNodeState}}") printf '%s\n' inactive ;;
+                "ps -aq") printf '%s\n' stopped-container ;;
+                "inspect --format {{.HostConfig.NetworkMode}} stopped-container") printf '%s\n' bridge ;;
+                "inspect --format {{.HostConfig.PublishAllPorts}} stopped-container") printf '%s\n' false ;;
+                "inspect --format {{range \$port, \$bindings := .HostConfig.PortBindings}}{{range \$bindings}}{{printf \"%s|%s|%s\\n\" \$port .HostIp .HostPort}}{{end}}{{end}} stopped-container")
+                    printf '%s\n' '80/tcp|0.0.0.0|8080'
+                    ;;
+                "inspect --format {{.State.Running}} stopped-container") printf '%s\n' false ;;
+                "network ls --format {{.ID}}|{{.Name}}|{{.Driver}}") : ;;
+                *)
+                    printf 'unexpected docker call: %s\n' "$*" >&2
+                    return 1
+                    ;;
+            esac
+        }
+
+        firewall_detect_docker_ports || fail "停止容器的固定映射应能完成检测"
+        assert_eq 8080 "$FW_DOCKER_TCP" "固定映射应进入 Docker TCP 端口集合"
+        assert_eq 8080 "$FW_DOCKER_PUBLIC4_TCP" "0.0.0.0 固定映射应进入 IPv4 公网端口集合"
+        assert_eq 8080 "$FW_DOCKER_PUBLIC_TCP" "停止容器的公网固定映射不得被遗漏"
+    )
+}
+
 main() {
     local name test status passed=0
     local -a required=(
@@ -298,6 +333,7 @@ main() {
         run_bounded_in_new_session
         run_bounded_with_timeout
         firewall_start_rollback_watchdog
+        firewall_detect_docker_ports
     )
     local -a tests=(
         test_port_decimal_normalization
@@ -307,6 +343,7 @@ main() {
         test_timeout_processes_release_lock
         test_busybox_timeout_fallback_releases_lock
         test_watchdog_survives_parent_without_holding_lock
+        test_stopped_docker_fixed_binding_is_public
     )
 
     command -v flock >/dev/null 2>&1 || fail "测试需要 flock"

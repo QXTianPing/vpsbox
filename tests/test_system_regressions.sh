@@ -323,6 +323,44 @@ test_signal_traps_preserve_exit_status() {
     done
 }
 
+test_uninstall_restore_offer_runs_internal_restore() {
+    (
+        local log="$TEST_TMP/uninstall-restore.log"
+        recorded_system_changes_present() { return 0; }
+        show_vpsbox_changes() { printf '%s\n' show >> "$log"; }
+        restore_vpsbox_system_changes() { printf 'restore:%s\n' "${1:-}" >> "$log"; }
+
+        offer_restore_recorded_changes_before_uninstall <<< "YES" >/dev/null
+        assert_file_contains "$log" '^show$'
+        assert_file_contains "$log" '^restore:1$' "卸载恢复应跳过重复确认并执行内部恢复"
+    )
+}
+
+test_uninstall_restore_offer_can_preserve_changes() {
+    (
+        local log="$TEST_TMP/uninstall-preserve.log"
+        : > "$log"
+        recorded_system_changes_present() { return 0; }
+        show_vpsbox_changes() { :; }
+        restore_vpsbox_system_changes() { printf '%s\n' restore >> "$log"; }
+
+        offer_restore_recorded_changes_before_uninstall <<< "NO" >/dev/null
+        assert_empty_file "$log" "选择保留现状时不得调用恢复"
+    )
+}
+
+test_uninstall_restore_failure_aborts_offer() {
+    (
+        recorded_system_changes_present() { return 0; }
+        show_vpsbox_changes() { :; }
+        restore_vpsbox_system_changes() { return 23; }
+
+        if offer_restore_recorded_changes_before_uninstall <<< "YES" >/dev/null 2>&1; then
+            fail "系统设置恢复失败时卸载前置步骤不应成功"
+        fi
+    )
+}
+
 main() {
     local test status passed=0
     local -a tests=(
@@ -343,6 +381,9 @@ main() {
         test_failed_ssh_tracking_cleanup_remains_retryable
         test_stale_unapplied_ssh_baseline_is_removed_on_next_run
         test_signal_traps_preserve_exit_status
+        test_uninstall_restore_offer_runs_internal_restore
+        test_uninstall_restore_offer_can_preserve_changes
+        test_uninstall_restore_failure_aborts_offer
     )
 
     for test in "${tests[@]}"; do
