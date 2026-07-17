@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.27"
+VPSBOX_VERSION="v1.0.28"
 # 只从当前仓库下载可执行脚本；旧地址仅用于识别本地 v1.0.23 及更早备份，绝不联网获取。
 SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
 LEGACY_SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
@@ -108,6 +108,10 @@ FW_EXTRA_UDP=""
 FW_SSH_PORTS=""
 FW_NODE_TCP=""
 FW_NODE_UDP=""
+FW_PUBLIC_TCP=""
+FW_PUBLIC_UDP=""
+FW_OTHER_PUBLIC_TCP=""
+FW_OTHER_PUBLIC_UDP=""
 FW_DOCKER_TCP=""
 FW_DOCKER_UDP=""
 FW_DOCKER_PUBLIC_TCP=""
@@ -1699,54 +1703,137 @@ is_loopback_listen_addr() {
     esac
 }
 
-show_ports_security_group() {
-    if ! command -v ss >/dev/null 2>&1; then
-        err "未找到 ss 命令，无法查看端口。"
-        return 1
+ipv4_listen_addr_is_public() {
+    local addr="$1" first second third fourth octet
+
+    [[ "$addr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS='.' read -r first second third fourth <<< "$addr"
+    for octet in "$first" "$second" "$third" "$fourth"; do
+        (( 10#$octet <= 255 )) || return 1
+    done
+    first=$((10#$first))
+    second=$((10#$second))
+    third=$((10#$third))
+
+    # IANA special-purpose, private, shared, loopback, link-local, documentation,
+    # benchmark, multicast and reserved ranges are not public listener addresses.
+    (( first == 0 || first == 10 || first == 127 || first >= 224 )) && return 1
+    (( first == 100 && second >= 64 && second <= 127 )) && return 1
+    (( first == 169 && second == 254 )) && return 1
+    (( first == 172 && second >= 16 && second <= 31 )) && return 1
+    (( first == 192 && second == 0 )) && return 1
+    (( first == 192 && second == 88 && third == 99 )) && return 1
+    (( first == 192 && second == 168 )) && return 1
+    (( first == 198 && (second == 18 || second == 19) )) && return 1
+    (( first == 198 && second == 51 && third == 100 )) && return 1
+    (( first == 203 && second == 0 && third == 113 )) && return 1
+    return 0
+}
+
+ipv6_listen_addr_is_public() {
+    local addr="${1,,}" embedded
+
+    addr="${addr%%%*}"
+    case "$addr" in
+        ::ffff:*.*.*.*)
+            embedded="${addr##*::ffff:}"
+            ipv4_listen_addr_is_public "$embedded"
+            return $?
+            ;;
+        ::|::1|0:0:0:0:0:0:0:0|0:0:0:0:0:0:0:1|100:*|fc*|fd*|fe[89ab]*|fe[cdef]*|ff*|2001:2:*|2001:10:*|2001:20:*|2001:db8:*|2002:*|3fff:*|5f00:*)
+            return 1
+            ;;
+        *:*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_public_listen_addr() {
+    local addr="${1,,}"
+
+    addr="${addr#[}"
+    addr="${addr/\]/}"
+    is_wildcard_listen_addr "$addr" && return 0
+    is_loopback_listen_addr "$addr" && return 1
+    if [[ "$addr" == *:* ]]; then
+        ipv6_listen_addr_is_public "$addr"
+    else
+        ipv4_listen_addr_is_public "$addr"
     fi
+}
 
-    local public_file
-    local local_file
-    local suggest_file
-    local proto
-    local state
-    local local_addr
-    local proc_info
-    local addr
-    local port
-    local proto_upper
-    local proc_name
+is_dhcp_client_listener() {
+    local protocol="$1" port="$2"
 
-    public_file="$(mktemp)"
-    local_file="$(mktemp)"
-    suggest_file="$(mktemp)"
+    [ "$protocol" = "udp" ] && { [ "$port" = "68" ] || [ "$port" = "546" ]; }
+}
+
+collect_listening_sockets() {
+    local output proto protocol state local_addr addr port proc_info proc_name scope
+    local _recvq _sendq _peer_addr
+
+    command -v ss >/dev/null 2>&1 || {
+        err "未找到 ss 命令，无法读取监听端口。"
+        return 1
+    }
+    output="$(ss -H -tulpn 2>/dev/null)" || {
+        err "无法读取系统监听端口。"
+        return 1
+    }
 
     while read -r proto state _recvq _sendq local_addr _peer_addr proc_info; do
-        case "$state" in
-            LISTEN|UNCONN) ;;
+        case "${proto,,}:$state" in
+            tcp*:LISTEN) protocol="tcp" ;;
+            udp*:UNCONN) protocol="udp" ;;
             *) continue ;;
         esac
 
         port="${local_addr##*:}"
-        [[ "$port" =~ ^[0-9]+$ ]] || continue
-
+        port="$(normalize_port_decimal "$port" 2>/dev/null)" || continue
         addr="${local_addr%:*}"
         addr="${addr#\[}"
-        addr="${addr%\]}"
+        addr="${addr/\]/}"
 
-        proto_upper="${proto^^}"
         proc_name="-"
         if [[ "${proc_info:-}" =~ \"([^\"]+)\" ]]; then
             proc_name="${BASH_REMATCH[1]}"
         fi
 
-        if is_loopback_listen_addr "$addr"; then
-            printf '%-5s %-8s %s\n' "$proto_upper" "$port" "$proc_name" >> "$local_file"
+        if is_dhcp_client_listener "$protocol" "$port"; then
+            scope="system"
+        elif is_loopback_listen_addr "$addr"; then
+            scope="local"
+        elif is_public_listen_addr "$addr"; then
+            scope="public"
         else
+            scope="nonpublic"
+        fi
+        printf '%s|%s|%s|%s|%s\n' "$scope" "$protocol" "$port" "$addr" "$proc_name"
+    done <<< "$output"
+}
+
+show_ports_security_group() {
+    local public_file local_file suggest_file records
+    local scope protocol port _addr proc_name proto_upper
+
+    public_file="$(mktemp)"
+    local_file="$(mktemp)"
+    suggest_file="$(mktemp)"
+    records="$(collect_listening_sockets)" || {
+        rm -f "$public_file" "$local_file" "$suggest_file"
+        return 1
+    }
+
+    while IFS='|' read -r scope protocol port _addr proc_name; do
+        [ -n "$scope" ] || continue
+        proto_upper="${protocol^^}"
+        if [ "$scope" = "public" ]; then
             printf '%-5s %-8s %s\n' "$proto_upper" "$port" "$proc_name" >> "$public_file"
             printf '%s %s\n' "$proto_upper" "$port" >> "$suggest_file"
+        else
+            printf '%-5s %-8s %s\n' "$proto_upper" "$port" "$proc_name" >> "$local_file"
         fi
-    done < <(ss -H -tulpn 2>/dev/null || true)
+    done <<< "$records"
 
     cat <<EOF
 ========================================
@@ -1762,7 +1849,7 @@ EOF
 
     cat <<EOF
 
-本机监听，无需安全组放行：
+本机或非公网监听，无需安全组放行：
 EOF
     if [ -s "$local_file" ]; then
         sort -u "$local_file"
@@ -6791,6 +6878,19 @@ merge_port_csv() {
     normalize_port_csv "$result"
 }
 
+subtract_port_csv() {
+    local result="${1:-}" excluded="${2:-}" port
+    local IFS=,
+
+    result="$(normalize_port_csv "$result")" || return 1
+    excluded="$(normalize_port_csv "$excluded")" || return 1
+    [ -n "$excluded" ] || { printf '%s\n' "$result"; return 0; }
+    for port in $excluded; do
+        result="$(csv_remove_port "$result" "$port")" || return 1
+    done
+    printf '%s\n' "$result"
+}
+
 port_csv_is_subset() {
     local required="${1:-}" available="${2:-}" port
     local IFS=,
@@ -7869,8 +7969,23 @@ docker_reserved_ports_for_port_choice() {
     printf '\n'
 }
 
+firewall_detect_public_listeners() {
+    local records scope protocol port _addr _proc_name
+
+    FW_PUBLIC_TCP=""
+    FW_PUBLIC_UDP=""
+    records="$(collect_listening_sockets)" || return 1
+    while IFS='|' read -r scope protocol port _addr _proc_name; do
+        [ "$scope" = "public" ] || continue
+        case "$protocol" in
+            tcp) FW_PUBLIC_TCP="$(csv_add_port "$FW_PUBLIC_TCP" "$port")" || return 1 ;;
+            udp) FW_PUBLIC_UDP="$(csv_add_port "$FW_PUBLIC_UDP" "$port")" || return 1 ;;
+        esac
+    done <<< "$records"
+}
+
 firewall_detect_allowed_ports() {
-    local ssh_configured_ports ssh_listening_ports
+    local ssh_configured_ports ssh_listening_ports known_tcp known_udp
 
     ssh_configured_ports="$(ssh_effective_ports_csv 2>/dev/null || true)"
     [ -n "$ssh_configured_ports" ] || {
@@ -7897,8 +8012,13 @@ firewall_detect_allowed_ports() {
     fi
 
     firewall_detect_docker_ports || return 1
-    FW_ALLOWED_TCP="$(merge_port_csv "$FW_SSH_PORTS" "$FW_NODE_TCP" "$FW_EXTRA_TCP")" || return 1
-    FW_ALLOWED_UDP="$(merge_port_csv "$FW_NODE_UDP" "$FW_EXTRA_UDP")" || return 1
+    firewall_detect_public_listeners || return 1
+    known_tcp="$(merge_port_csv "$FW_SSH_PORTS" "$FW_NODE_TCP" "$FW_DOCKER_PUBLIC_TCP" "$FW_EXTRA_TCP")" || return 1
+    known_udp="$(merge_port_csv "$FW_NODE_UDP" "$FW_DOCKER_PUBLIC_UDP" "$FW_EXTRA_UDP")" || return 1
+    FW_OTHER_PUBLIC_TCP="$(subtract_port_csv "$FW_PUBLIC_TCP" "$known_tcp")" || return 1
+    FW_OTHER_PUBLIC_UDP="$(subtract_port_csv "$FW_PUBLIC_UDP" "$known_udp")" || return 1
+    FW_ALLOWED_TCP="$(merge_port_csv "$FW_SSH_PORTS" "$FW_NODE_TCP" "$FW_PUBLIC_TCP" "$FW_EXTRA_TCP")" || return 1
+    FW_ALLOWED_UDP="$(merge_port_csv "$FW_NODE_UDP" "$FW_PUBLIC_UDP" "$FW_EXTRA_UDP")" || return 1
 }
 
 firewall_write_config() {
@@ -8698,17 +8818,19 @@ firewall_show_port_summary() {
  SSH TCP：${FW_SSH_PORTS:--}
  节点 TCP：${FW_NODE_TCP:--}
  节点 UDP：${FW_NODE_UDP:--}
- 额外 TCP：${FW_EXTRA_TCP:--}
- 额外 UDP：${FW_EXTRA_UDP:--}
  Docker TCP：${FW_DOCKER_PUBLIC_TCP:--}
  Docker UDP：${FW_DOCKER_PUBLIC_UDP:--}
+ 其他公网 TCP：${FW_OTHER_PUBLIC_TCP:--}
+ 其他公网 UDP：${FW_OTHER_PUBLIC_UDP:--}
+ 额外 TCP：${FW_EXTRA_TCP:--}
+ 额外 UDP：${FW_EXTRA_UDP:--}
  默认入站策略：拒绝
  出站：不创建规则
  Docker 转发：仅检查已发布端口，不限制容器出站
 ----------------------------------------
 EOF
     if [ "$FW_DOCKER_HOST_NETWORK" = "1" ]; then
-        warn "检测到 host 网络模式容器，其监听端口需通过额外放行端口菜单手动添加。"
+        warn "检测到 host 网络模式容器；当前公网监听已自动纳入，未启动服务请通过额外端口提前放行。"
     fi
     if [ "$FW_DOCKER_DYNAMIC_PORT" = "1" ]; then
         warn "检测到尚未确定的 Docker 随机发布端口；容器启动后请重新更新防火墙。"
@@ -8740,7 +8862,7 @@ firewall_apply_desired_state() {
     read -r -p "确认应用以上规则？请输入 YES：" answer || return 1
     [ "$answer" = "YES" ] || { info "已取消，未修改防火墙。"; return 0; }
 
-    # 用户确认期间 ssh.socket、sshd 或 Docker 可能变化；落盘前重新取一次实时状态。
+    # 用户确认期间 ssh.socket、sshd、Docker 或公网监听可能变化；落盘前重新取一次实时状态。
     firewall_detect_allowed_ports || {
         err "确认后端口状态发生异常，未修改防火墙。"
         return 1
@@ -8872,7 +8994,7 @@ firewall_sync_active_config() {
         return 1
     fi
     rm -f "$tmp" "$backup"
-    [ "$quiet" = "1" ] || info "主机防火墙已同步当前 SSH、节点和 Docker 端口。"
+    [ "$quiet" = "1" ] || info "主机防火墙已同步当前 SSH、节点、Docker 和公网监听端口。"
 }
 
 firewall_prepare_port_transition() {
@@ -9234,6 +9356,315 @@ firewall_live_config_matches_expected() {
     ! nft list set inet vpsbox docker_udp_ports >/dev/null 2>&1 || return 1
 }
 
+firewall_config_direct_ports() {
+    local source="$1" protocol="$2"
+
+    [ -f "$source" ] && [ ! -L "$source" ] || return 1
+    case "$protocol" in tcp|udp) ;; *) return 2 ;; esac
+    awk '
+        /^[[:space:]]*chain[[:space:]]+input[[:space:]]*\{/ { in_input=1; next }
+        in_input && /^[[:space:]]*\}/ { exit }
+        in_input && $0 !~ /meta nfproto/ { print }
+    ' "$source" | firewall_ports_from_nft_chain "$protocol"
+}
+
+firewall_config_port_set_matches() {
+    local source="$1" set_name="$2" expected="$3" body actual count
+
+    count="$(grep -Ec "^[[:space:]]*set[[:space:]]+${set_name}[[:space:]]*\\{" "$source" || true)"
+    if [ -z "$expected" ]; then
+        [ "$count" -eq 0 ]
+        return
+    fi
+    [ "$count" -eq 1 ] || return 1
+    expected="$(normalize_port_csv "$expected")" || return 1
+    body="$(firewall_set_body_lines "$set_name" < "$source")" || return 1
+    actual="$(printf '%s\n' "$body" | firewall_discrete_port_set_values)" || return 1
+    [ "$actual" = "$expected" ]
+}
+
+firewall_config_additive_shape_valid() {
+    local source="$1" old_tcp="$2" old_udp="$3"
+    local direct_tcp direct_udp count expected_rule
+
+    [ -f "$source" ] && [ ! -L "$source" ] || return 1
+    grep -Fqx '# Managed by vpsbox. Replace only the dedicated table; never flush the global ruleset.' "$source" || return 1
+    [ "$(grep -Ec '^[[:space:]]*table[[:space:]]+inet[[:space:]]+vpsbox[[:space:]]*\{' "$source" || true)" -eq 1 ] || return 1
+    for count in input docker_port_guard docker_forward; do
+        [ "$(grep -Ec "^[[:space:]]*chain[[:space:]]+${count}[[:space:]]*\\{" "$source" || true)" -eq 1 ] || return 1
+    done
+    ! grep -Eq '^[[:space:]]*chain[[:space:]]+output[[:space:]]*\{' "$source" || return 1
+    [ "$(grep -Ec '^[[:space:]]*tcp[[:space:]]+dport[[:space:]]+\{[^}]+\}[[:space:]]+accept[[:space:]]*$' "$source" || true)" -eq 1 ] || return 1
+    [ "$(grep -Ec '^[[:space:]]*udp[[:space:]]+dport[[:space:]]+\{[^}]+\}[[:space:]]+accept[[:space:]]*$' "$source" || true)" -le 1 ] || return 1
+
+    direct_tcp="$(firewall_config_direct_ports "$source" tcp)" || return 1
+    direct_udp="$(firewall_config_direct_ports "$source" udp)" || return 1
+    [ -n "$direct_tcp" ] || return 1
+    port_csv_is_subset "$old_tcp" "$direct_tcp" || return 1
+    port_csv_is_subset "$old_udp" "$direct_udp" || return 1
+    firewall_config_port_set_matches "$source" extra_tcp_dnat_ports "$old_tcp" || return 1
+    firewall_config_port_set_matches "$source" extra_udp_dnat_ports "$old_udp" || return 1
+
+    expected_rule='        meta l4proto tcp ct original proto-dst @extra_tcp_dnat_ports accept'
+    count="$(grep -Fxc "$expected_rule" "$source" || true)"
+    if [ -n "$old_tcp" ]; then [ "$count" -eq 1 ] || return 1; else [ "$count" -eq 0 ] || return 1; fi
+    expected_rule='        meta l4proto udp ct original proto-dst @extra_udp_dnat_ports accept'
+    count="$(grep -Fxc "$expected_rule" "$source" || true)"
+    if [ -n "$old_udp" ]; then [ "$count" -eq 1 ] || return 1; else [ "$count" -eq 0 ] || return 1; fi
+}
+
+firewall_replace_input_direct_ports() {
+    local source="$1" dest="$2" protocol="$3" ports="$4" formatted
+
+    ports="$(normalize_port_csv "$ports")" || return 1
+    [ -n "$ports" ] || return 1
+    formatted="$(printf '%s' "$ports" | sed 's/,/, /g')"
+    awk -v protocol="$protocol" -v formatted="$formatted" '
+        function emit_rule() {
+            print "        " protocol " dport { " formatted " } accept"
+            inserted=1
+        }
+        /^[[:space:]]*chain[[:space:]]+input[[:space:]]*\{/ {
+            in_input=1
+            print
+            next
+        }
+        in_input {
+            target="^[[:space:]]*" protocol "[[:space:]]+dport[[:space:]]+\\{[^}]+\\}[[:space:]]+accept[[:space:]]*$"
+            if ($0 ~ target) {
+                seen++
+                if (!inserted) emit_rule()
+                next
+            }
+            if (!inserted && protocol == "tcp" && $0 ~ /^[[:space:]]*udp[[:space:]]+dport[[:space:]]+/) emit_rule()
+            if (!inserted && $0 ~ /^[[:space:]]*meta[[:space:]]+nfproto.*(tcp|udp)[[:space:]]+dport[[:space:]]+/) emit_rule()
+            if (!inserted && $0 ~ /^[[:space:]]*}[[:space:]]*$/) emit_rule()
+            if ($0 ~ /^[[:space:]]*}[[:space:]]*$/) in_input=0
+        }
+        { print }
+        END { if (!inserted || seen > 1) exit 1 }
+    ' "$source" > "$dest"
+}
+
+firewall_replace_extra_port_set() {
+    local source="$1" dest="$2" set_name="$3" ports="$4" anchor="$5" formatted
+
+    ports="$(normalize_port_csv "$ports")" || return 1
+    [ -n "$ports" ] || return 1
+    formatted="$(printf '%s' "$ports" | sed 's/,/, /g')"
+    awk -v target="$set_name" -v formatted="$formatted" -v anchor="$anchor" '
+        function emit_set() {
+            print "    set " target " {"
+            print "        type inet_service"
+            print "        elements = { " formatted " }"
+            print "    }"
+            print ""
+            inserted=1
+        }
+        skipping {
+            if ($0 ~ /^[[:space:]]*}[[:space:]]*$/) skipping=0
+            next
+        }
+        $1 == "set" && $2 == target && $3 == "{" {
+            seen++
+            if (!inserted) emit_set()
+            skipping=1
+            next
+        }
+        !inserted && anchor != "" && $1 == "set" && $2 == anchor && $3 == "{" { emit_set() }
+        !inserted && $1 == "chain" && $2 == "input" && $3 == "{" { emit_set() }
+        { print }
+        END { if (!inserted || skipping || seen > 1) exit 1 }
+    ' "$source" > "$dest"
+}
+
+firewall_ensure_extra_guard_rule() {
+    local source="$1" dest="$2" protocol="$3" rule count
+
+    rule="        meta l4proto $protocol ct original proto-dst @extra_${protocol}_dnat_ports accept"
+    count="$(grep -Fxc "$rule" "$source" || true)"
+    if [ "$count" -eq 1 ]; then
+        cp "$source" "$dest"
+        return
+    fi
+    [ "$count" -eq 0 ] || return 1
+    awk -v protocol="$protocol" -v rule="$rule" '
+        /^[[:space:]]*chain[[:space:]]+docker_port_guard[[:space:]]*\{/ {
+            in_guard=1
+            print
+            if (protocol == "tcp") { print rule; inserted=1 }
+            next
+        }
+        in_guard && protocol == "udp" && $0 ~ /^[[:space:]]*meta[[:space:]]+l4proto[[:space:]]+tcp[[:space:]]+drop[[:space:]]*$/ {
+            print
+            print rule
+            inserted=1
+            next
+        }
+        in_guard && $0 ~ /^[[:space:]]*}[[:space:]]*$/ { in_guard=0 }
+        { print }
+        END { if (!inserted) exit 1 }
+    ' "$source" > "$dest"
+}
+
+firewall_build_config_with_added_ports() {
+    local source="$1" dest="$2" protocols="$3"
+    local work_dir current next protocol direct desired set_name anchor
+
+    case "$protocols" in tcp|udp|both) ;; *) return 2 ;; esac
+    work_dir="$(mktemp -d "$(dirname "$dest")/.firewall-add-build.XXXXXX")" || return 1
+    current="$work_dir/current.nft"
+    cp "$source" "$current" || { rm -rf "$work_dir"; return 1; }
+    for protocol in tcp udp; do
+        [ "$protocols" = "both" ] || [ "$protocols" = "$protocol" ] || continue
+        if [ "$protocol" = "tcp" ]; then
+            desired="$FW_EXTRA_TCP"
+            set_name=extra_tcp_dnat_ports
+            anchor=extra_udp_dnat_ports
+        else
+            desired="$FW_EXTRA_UDP"
+            set_name=extra_udp_dnat_ports
+            anchor=""
+        fi
+        direct="$(firewall_config_direct_ports "$current" "$protocol")" || { rm -rf "$work_dir"; return 1; }
+        direct="$(merge_port_csv "$direct" "$desired")" || { rm -rf "$work_dir"; return 1; }
+        next="$work_dir/input-$protocol.nft"
+        firewall_replace_input_direct_ports "$current" "$next" "$protocol" "$direct" || { rm -rf "$work_dir"; return 1; }
+        current="$next"
+        next="$work_dir/set-$protocol.nft"
+        firewall_replace_extra_port_set "$current" "$next" "$set_name" "$desired" "$anchor" || { rm -rf "$work_dir"; return 1; }
+        current="$next"
+        next="$work_dir/guard-$protocol.nft"
+        firewall_ensure_extra_guard_rule "$current" "$next" "$protocol" || { rm -rf "$work_dir"; return 1; }
+        current="$next"
+    done
+    cp "$current" "$dest" || { rm -rf "$work_dir"; return 1; }
+    rm -rf "$work_dir"
+}
+
+firewall_check_config_file() {
+    local config="$1" table_existed=0 status=0
+
+    command -v nft >/dev/null 2>&1 || return 1
+    nft list table inet vpsbox >/dev/null 2>&1 && table_existed=1
+    if [ "$table_existed" -eq 0 ] && ! nft add table inet vpsbox; then
+        return 1
+    fi
+    nft -c -f "$config" >/dev/null 2>&1 || status=1
+    [ "$table_existed" -eq 1 ] || nft delete table inet vpsbox >/dev/null 2>&1 || true
+    return "$status"
+}
+
+firewall_live_added_ports_match() {
+    local protocols="$1" port="$2" input_ports
+
+    case "$protocols" in tcp|udp|both) ;; *) return 2 ;; esac
+    if [ "$protocols" = "tcp" ] || [ "$protocols" = "both" ]; then
+        input_ports="$(nft -nn list chain inet vpsbox input 2>/dev/null | firewall_ports_from_nft_chain tcp)" || return 1
+        csv_contains_port "$input_ports" "$port" || return 1
+        firewall_live_port_set_matches extra_tcp_dnat_ports "$FW_EXTRA_TCP" || return 1
+    fi
+    if [ "$protocols" = "udp" ] || [ "$protocols" = "both" ]; then
+        input_ports="$(nft -nn list chain inet vpsbox input 2>/dev/null | firewall_ports_from_nft_chain udp)" || return 1
+        csv_contains_port "$input_ports" "$port" || return 1
+        firewall_live_port_set_matches extra_udp_dnat_ports "$FW_EXTRA_UDP" || return 1
+    fi
+}
+
+firewall_restore_additive_snapshot() {
+    local rollback_dir="$1" commit_owner="${2:-0}"
+
+    if ! firewall_restore_snapshot_now "$rollback_dir" "$commit_owner"; then
+        err "新增端口失败且旧防火墙状态未能自动恢复，快照保留在：$rollback_dir"
+        return 1
+    fi
+}
+
+firewall_apply_added_ports() {
+    local protocols="$1" port="$2" old_tcp="$3" old_udp="$4"
+    local work_dir rollback_dir old_direct_tcp was_runtime=0 committed=0 persist_failed=0
+    local new_config new_state
+
+    case "$protocols" in tcp|udp|both) ;; *) return 2 ;; esac
+    firewall_recover_pending_rollbacks || return 1
+    firewall_runtime_enabled && was_runtime=1
+    firewall_managed_file_is_secure "$FIREWALL_CONFIG" || {
+        err "当前防火墙配置不是安全的 vpsbox 受管文件；请使用 [1] 一键开启/更新防火墙。"
+        return 1
+    }
+    firewall_state_file_is_secure || {
+        err "当前防火墙状态文件不可用；请使用 [1] 一键开启/更新防火墙。"
+        return 1
+    }
+    if ! firewall_config_additive_shape_valid "$FIREWALL_CONFIG" "$old_tcp" "$old_udp"; then
+        err "当前防火墙规则结构无法安全执行增量更新；请使用 [1] 一键开启/更新防火墙。"
+        return 1
+    fi
+
+    prepare_runtime_dir || return 1
+    work_dir="$(mktemp -d "$RUNTIME_DIR/firewall-add.XXXXXX")" || return 1
+    new_config="$work_dir/firewall.nft"
+    new_state="$work_dir/firewall.env"
+    if ! firewall_build_config_with_added_ports "$FIREWALL_CONFIG" "$new_config" "$protocols" ||
+        ! firewall_write_state_file "$new_state" ||
+        ! firewall_check_config_file "$new_config"; then
+        rm -rf "$work_dir"
+        err "无法生成或校验新增端口后的防火墙配置。"
+        return 1
+    fi
+    old_direct_tcp="$(firewall_config_direct_ports "$FIREWALL_CONFIG" tcp)" || {
+        rm -rf "$work_dir"
+        return 1
+    }
+    if ! firewall_create_rollback_snapshot rollback_dir "$old_direct_tcp"; then
+        rm -rf "$work_dir"
+        err "无法创建新增端口的防火墙回滚快照。"
+        return 1
+    fi
+
+    if [ "$was_runtime" -eq 1 ]; then
+        if ! firewall_apply_config_file "$new_config" ||
+            ! firewall_live_added_ports_match "$protocols" "$port"; then
+            err "新增端口的运行规则验证失败，正在恢复旧状态。"
+            firewall_restore_additive_snapshot "$rollback_dir" || true
+            rm -rf "$work_dir"
+            return 1
+        fi
+    fi
+    if ! firewall_begin_commit "$rollback_dir"; then
+        err "新增端口提交前回滚快照状态异常，正在恢复旧状态。"
+        firewall_restore_additive_snapshot "$rollback_dir" || true
+        rm -rf "$work_dir"
+        return 1
+    fi
+    committed=1
+    if ! firewall_install_managed_file "$new_config" "$FIREWALL_CONFIG" 600; then
+        persist_failed=1
+    elif ! firewall_install_managed_file "$new_state" "$FIREWALL_STATE_FILE" 600; then
+        persist_failed=1
+    elif [ "$was_runtime" -eq 1 ] && ! firewall_live_added_ports_match "$protocols" "$port"; then
+        persist_failed=1
+    fi
+    if [ "$persist_failed" -ne 0 ]; then
+        err "新增端口的持久化验证失败，正在恢复旧状态。"
+        firewall_restore_additive_snapshot "$rollback_dir" "$committed" || true
+        rm -rf "$work_dir"
+        return 1
+    fi
+    if ! firewall_finish_commit "$rollback_dir"; then
+        err "新增端口提交收尾失败，正在恢复旧状态。"
+        firewall_restore_additive_snapshot "$rollback_dir" "$committed" || true
+        rm -rf "$work_dir"
+        return 1
+    fi
+    rm -rf "$work_dir"
+    if [ "$was_runtime" -eq 1 ]; then
+        info "已轻量放行 $protocols 端口：$port"
+    else
+        info "额外端口已保存；防火墙下次启动时会自动放行：$port"
+    fi
+}
+
 firewall_config_matches_expected() {
     local tmp status=0
     [ -f "$FIREWALL_CONFIG" ] && [ -f "$FIREWALL_STATE_FILE" ] || return 1
@@ -9262,8 +9693,10 @@ firewall_view_rules() {
  节点       UDP        ${FW_NODE_UDP:--}
  Docker     TCP        ${FW_DOCKER_PUBLIC_TCP:--}
  Docker     UDP        ${FW_DOCKER_PUBLIC_UDP:--}
- 额外端口   TCP        ${FW_EXTRA_TCP:--}
- 额外端口   UDP        ${FW_EXTRA_UDP:--}
+ 其他公网   TCP        ${FW_OTHER_PUBLIC_TCP:--}
+ 其他公网   UDP        ${FW_OTHER_PUBLIC_UDP:--}
+额外端口   TCP        ${FW_EXTRA_TCP:--}
+额外端口   UDP        ${FW_EXTRA_UDP:--}
 ----------------------------------------
  防火墙：$(firewall_runtime_state)
  开机加载：$(firewall_persistence_state)
@@ -9305,20 +9738,37 @@ firewall_prompt_port() {
 }
 
 firewall_add_extra_port() {
-    local protocol="$1" port
+    local protocol="$1" port old_tcp old_udp
     firewall_settle_pending_port_transition || return 1
     firewall_load_state || return 1
     port="$(firewall_prompt_port)" || return 1
+    old_tcp="$FW_EXTRA_TCP"
+    old_udp="$FW_EXTRA_UDP"
     case "$protocol" in
-        tcp) FW_EXTRA_TCP="$(csv_add_port "$FW_EXTRA_TCP" "$port")" ;;
-        udp) FW_EXTRA_UDP="$(csv_add_port "$FW_EXTRA_UDP" "$port")" ;;
+        tcp)
+            csv_contains_port "$FW_EXTRA_TCP" "$port" && { info "额外 TCP 已放行端口：$port"; return 0; }
+            FW_EXTRA_TCP="$(csv_add_port "$FW_EXTRA_TCP" "$port")"
+            ;;
+        udp)
+            csv_contains_port "$FW_EXTRA_UDP" "$port" && { info "额外 UDP 已放行端口：$port"; return 0; }
+            FW_EXTRA_UDP="$(csv_add_port "$FW_EXTRA_UDP" "$port")"
+            ;;
         both)
+            if csv_contains_port "$FW_EXTRA_TCP" "$port" && csv_contains_port "$FW_EXTRA_UDP" "$port"; then
+                info "额外 TCP/UDP 已放行端口：$port"
+                return 0
+            fi
             FW_EXTRA_TCP="$(csv_add_port "$FW_EXTRA_TCP" "$port")"
             FW_EXTRA_UDP="$(csv_add_port "$FW_EXTRA_UDP" "$port")"
             ;;
         *) return 1 ;;
     esac
-    firewall_commit_port_state
+    if firewall_control_plane_present; then
+        firewall_apply_added_ports "$protocol" "$port" "$old_tcp" "$old_udp"
+    else
+        firewall_save_inactive_state || return 1
+        info "额外端口已保存；启用主机防火墙时会自动使用。"
+    fi
 }
 
 firewall_remove_extra_port() {
@@ -9437,7 +9887,8 @@ firewall_disable() {
 }
 
 firewall_menu() {
-    local opt ssh_ports node_tcp node_udp docker_tcp docker_udp
+    local opt ssh_ports node_tcp node_udp docker_tcp docker_udp public_tcp public_udp
+    local ssh_known node_tcp_known node_udp_known docker_tcp_known docker_udp_known known_tcp known_udp
 
     firewall_settle_pending_port_transition || return 1
     while true; do
@@ -9460,6 +9911,21 @@ firewall_menu() {
             docker_tcp="daemon 不可用"
             docker_udp="daemon 不可用"
         fi
+        public_tcp="-"
+        public_udp="-"
+        if firewall_detect_public_listeners 2>/dev/null; then
+            ssh_known="$(normalize_port_csv "$ssh_ports" 2>/dev/null || true)"
+            node_tcp_known="$(normalize_port_csv "$node_tcp" 2>/dev/null || true)"
+            node_udp_known="$(normalize_port_csv "$node_udp" 2>/dev/null || true)"
+            docker_tcp_known="$(normalize_port_csv "$docker_tcp" 2>/dev/null || true)"
+            docker_udp_known="$(normalize_port_csv "$docker_udp" 2>/dev/null || true)"
+            known_tcp="$(merge_port_csv "$ssh_known" "$node_tcp_known" "$docker_tcp_known" "$FW_EXTRA_TCP")"
+            known_udp="$(merge_port_csv "$node_udp_known" "$docker_udp_known" "$FW_EXTRA_UDP")"
+            public_tcp="$(subtract_port_csv "$FW_PUBLIC_TCP" "$known_tcp")"
+            public_udp="$(subtract_port_csv "$FW_PUBLIC_UDP" "$known_udp")"
+            public_tcp="${public_tcp:--}"
+            public_udp="${public_udp:--}"
+        fi
 
         clear 2>/dev/null || true
         cat <<EOF
@@ -9475,7 +9941,9 @@ firewall_menu() {
  节点 UDP：$node_udp
  Docker TCP：$docker_tcp
  Docker UDP：$docker_udp
- 额外 TCP：${FW_EXTRA_TCP:--}
+ 其他公网 TCP：$public_tcp
+ 其他公网 UDP：$public_udp
+额外 TCP：${FW_EXTRA_TCP:--}
  额外 UDP：${FW_EXTRA_UDP:--}
  默认入站：拒绝未放行的连接
  出站规则：不创建
@@ -9741,7 +10209,7 @@ EOF
             check_fail "防火墙自启" "未正常启用"
         fi
         if firewall_config_matches_expected >/dev/null 2>&1; then
-            check_ok "防火墙端口" "与 SSH/节点/Docker 状态一致"
+            check_ok "防火墙端口" "与 SSH/节点/Docker/公网监听状态一致"
         else
             check_fail "防火墙端口" "配置已过期，请执行防火墙更新"
         fi
