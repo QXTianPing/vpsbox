@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.33"
+VPSBOX_VERSION="v1.0.34"
 # 只从当前仓库下载可执行脚本；旧地址仅用于识别本地 v1.0.23 及更早备份，绝不联网获取。
 SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
 LEGACY_SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
@@ -12039,8 +12039,8 @@ firewall_view_rules() {
  Docker     UDP        ${FW_DOCKER_PUBLIC_UDP:--}
  其他公网   TCP        ${FW_OTHER_PUBLIC_TCP:--}
  其他公网   UDP        ${FW_OTHER_PUBLIC_UDP:--}
-额外端口   TCP        ${FW_EXTRA_TCP:--}
-额外端口   UDP        ${FW_EXTRA_UDP:--}
+ 额外端口   TCP        ${FW_EXTRA_TCP:--}
+ 额外端口   UDP        ${FW_EXTRA_UDP:--}
 ----------------------------------------
  防火墙：$(firewall_runtime_state)
  开机加载：$(firewall_persistence_state)
