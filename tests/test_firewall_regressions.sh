@@ -220,6 +220,150 @@ test_stopped_public_service_is_removed_unless_extra() {
     )
 }
 
+emit_live_firewall_table_sample() {
+    cat <<'EOF'
+table inet vpsbox {
+    set docker4_tcp_ports {
+        type inet_service
+        elements = { 18080 }
+    }
+    set docker6_udp_ports {
+        type inet_service
+        elements = { 18443 }
+    }
+    set extra_tcp_dnat_ports {
+        type inet_service
+        elements = { 20000 }
+    }
+    chain input {
+        type filter hook input priority filter; policy drop;
+        meta nfproto ipv4 udp sport 67 udp dport 68 accept
+        meta nfproto ipv6 udp sport 547 udp dport 546 accept
+        tcp dport { 23333, 31423 } accept
+        udp dport 31423 accept
+    }
+    chain docker_port_guard {
+        meta l4proto tcp ct original proto-dst @extra_tcp_dnat_ports accept
+        meta nfproto ipv4 meta l4proto tcp oifname @docker_bridge_ifaces ct original proto-dst @docker4_tcp_ports accept
+        meta l4proto tcp drop
+        meta nfproto ipv6 meta l4proto udp oifname @docker_bridge_ifaces ct original proto-dst @docker6_udp_ports accept
+        meta l4proto udp drop
+        drop
+    }
+    chain docker_forward {
+        type filter hook forward priority -1; policy accept;
+        ct direction original ct status dnat jump docker_port_guard
+    }
+}
+EOF
+}
+
+test_view_rules_reads_live_nft_instead_of_current_listeners() {
+    (
+        local output="$TEST_TMP/firewall-live-view.out"
+        firewall_runtime_enabled() { return 0; }
+        firewall_persistence_state() { printf '已启用\n'; }
+        firewall_detect_allowed_ports() { fail "查看实际规则不得重新扫描当前监听"; }
+        nft() {
+            [ "$*" = '-nn list table inet vpsbox' ] || return 1
+            emit_live_firewall_table_sample
+        }
+
+        firewall_view_rules > "$output"
+
+        assert_file_contains "$output" '主机入站[[:space:]]+TCP[[:space:]]+23333,31423'
+        assert_file_contains "$output" '主机入站[[:space:]]+UDP[[:space:]]+31423'
+        assert_file_contains "$output" 'Docker 转发[[:space:]]+TCP[[:space:]]+18080'
+        assert_file_contains "$output" 'Docker 转发[[:space:]]+UDP[[:space:]]+18443'
+        assert_file_contains "$output" '额外 DNAT[[:space:]]+TCP[[:space:]]+20000'
+        assert_file_not_contains "$output" '(^|[^0-9])(68|546|80|443)([^0-9]|$)' \
+            "未实际放行的新监听和 DHCP 客户端端口不得显示"
+    )
+}
+
+test_view_rules_inactive_reports_no_live_ports_without_scanning() {
+    (
+        local output="$TEST_TMP/firewall-inactive-view.out"
+        firewall_runtime_enabled() { return 1; }
+        firewall_runtime_state() { printf '配置存在但未运行\n'; }
+        firewall_persistence_state() { printf '已启用\n'; }
+        firewall_detect_allowed_ports() { fail "停用防火墙的查看操作不得扫描期望端口"; }
+        nft() { fail "停用防火墙时不得读取不存在的 live 表"; }
+
+        firewall_view_rules > "$output"
+
+        assert_file_contains "$output" '主机入站[[:space:]]+TCP[[:space:]]+-$'
+        assert_file_contains "$output" '防火墙：配置存在但未运行'
+        assert_file_contains "$output" '当前没有正在生效的 vpsbox 防火墙规则'
+    )
+}
+
+test_view_rules_accepts_normalized_forward_priority_expression() {
+    (
+        local output="$TEST_TMP/firewall-normalized-forward-priority.out"
+        firewall_runtime_enabled() { return 0; }
+        firewall_persistence_state() { printf '已启用\n'; }
+        nft() {
+            [ "$*" = '-nn list table inet vpsbox' ] || return 1
+            emit_live_firewall_table_sample | sed 's/hook forward priority -1; policy accept;/hook forward priority filter - 1; policy accept;/'
+        }
+
+        firewall_view_rules > "$output"
+        assert_file_contains "$output" 'Docker 转发[[:space:]]+TCP[[:space:]]+18080'
+        assert_file_contains "$output" '防火墙：运行中'
+    )
+}
+
+test_view_rules_rejects_unhooked_or_permissive_base_chains() {
+    (
+        local output="$TEST_TMP/firewall-invalid-input-base.out"
+        firewall_runtime_enabled() { return 0; }
+        firewall_persistence_state() { printf '已启用\n'; }
+        nft() {
+            [ "$*" = '-nn list table inet vpsbox' ] || return 1
+            emit_live_firewall_table_sample | sed 's/hook input priority filter; policy drop;/hook input priority filter; policy accept;/'
+        }
+
+        if firewall_view_rules > "$output" 2>&1; then
+            fail "policy accept 的 input 链不得被报告为正在生效的放行规则"
+        fi
+        assert_file_contains "$output" '无法可靠读取当前 nftables 放行规则'
+    )
+    (
+        local output="$TEST_TMP/firewall-invalid-forward-base.out"
+        firewall_runtime_enabled() { return 0; }
+        firewall_persistence_state() { printf '已启用\n'; }
+        nft() {
+            [ "$*" = '-nn list table inet vpsbox' ] || return 1
+            emit_live_firewall_table_sample | sed 's/hook forward priority -1; policy accept;/hook forward priority 0; policy accept;/'
+        }
+
+        if firewall_view_rules > "$output" 2>&1; then
+            fail "未使用受管优先级的 forward 链不得被报告为有效 Docker 转发规则"
+        fi
+        assert_file_contains "$output" '无法可靠读取当前 nftables 放行规则'
+    )
+}
+
+test_firewall_table_parsers_consume_large_trailing_input() {
+    local table body rules i
+
+    table="$(
+        emit_live_firewall_table_sample
+        for ((i = 0; i < 12000; i++)); do
+            printf '# trailing filler for pipefail regression %05d\n' "$i"
+        done
+    )"
+    body="$(printf '%s\n' "$table" | firewall_set_body_lines docker4_tcp_ports)" ||
+        fail "set 解析器不得因提前关闭大型输入管道而触发 pipefail"
+    rules="$(printf '%s\n' "$table" | firewall_chain_rule_lines input)" ||
+        fail "chain 解析器不得因提前关闭大型输入管道而触发 pipefail"
+    [[ "$body" == *'elements = { 18080 }'* ]] ||
+        fail "大型表中的端口 set 未正确解析"
+    [[ "$rules" == *'tcp dport { 23333, 31423 } accept'* ]] ||
+        fail "大型表中的 input 规则未正确解析"
+}
+
 test_systemd_enabled_inactive_firewalld_conflict() {
     (
         # Consumed by firewall_firewalld_enabled_or_active from the sourced script.
@@ -600,6 +744,8 @@ main() {
         firewall_detect_public_listeners
         firewall_detect_allowed_ports
         firewall_build_config_with_added_ports
+        firewall_read_live_allowed_ports
+        firewall_view_rules
     )
     local -a tests=(
         test_port_decimal_normalization
@@ -608,6 +754,11 @@ main() {
         test_security_group_suggestions_exclude_dhcp_clients
         test_allowed_ports_merge_known_public_docker_and_extra_sources
         test_stopped_public_service_is_removed_unless_extra
+        test_view_rules_reads_live_nft_instead_of_current_listeners
+        test_view_rules_inactive_reports_no_live_ports_without_scanning
+        test_view_rules_accepts_normalized_forward_priority_expression
+        test_view_rules_rejects_unhooked_or_permissive_base_chains
+        test_firewall_table_parsers_consume_large_trailing_input
         test_systemd_enabled_inactive_firewalld_conflict
         test_openrc_enabled_inactive_firewalld_conflict
         test_bounded_background_processes_release_lock

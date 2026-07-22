@@ -3,12 +3,13 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.39"
+VPSBOX_VERSION="v1.0.40"
 # 只从当前仓库下载可执行脚本；旧地址仅用于识别本地 v1.0.23 及更早备份，绝不联网获取。
 SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
 LEGACY_SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
+NEXTTRACE_HELP_TIMEOUT=8
 DEFAULT_REALITY_SERVER_NAME="addons.mozilla.org"
 CMD_PATH="/usr/local/bin/vpsbox"
 CONFIG_DIR="/etc/sing-box"
@@ -1307,6 +1308,41 @@ download_verified_github_asset() {
     fi
 }
 
+singbox_release_package_arch() {
+    local machine
+
+    case "$OS" in
+        debian)
+            command -v dpkg >/dev/null 2>&1 || return 1
+            dpkg --print-architecture
+            ;;
+        alpine)
+            command -v apk >/dev/null 2>&1 || return 1
+            apk --print-arch
+            ;;
+        redhat)
+            machine="$(uname -m)" || return 1
+            case "$machine" in
+                amd64) printf '%s\n' x86_64 ;;
+                arm64) printf '%s\n' aarch64 ;;
+                armv7|armv7l) printf '%s\n' armv7hl ;;
+                armv6|armv6l) printf '%s\n' armv6hl ;;
+                i386|i486|i586|i686) printf '%s\n' i386 ;;
+                ppc64el) printf '%s\n' ppc64le ;;
+                mips64le) printf '%s\n' mips64el ;;
+                x86_64|aarch64|armv7hl|armv6hl|loongarch64|mips64el|mipsel|ppc64le|riscv64|s390x)
+                    printf '%s\n' "$machine"
+                    ;;
+                *)
+                    err "当前 RedHat 架构没有对应的 sing-box RPM：$machine"
+                    return 1
+                    ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 run_singbox_installer() {
     local version="${1:-$SINGBOX_RELEASE_VERSION}"
     local arch suffix asset tmp_dir tmp
@@ -1315,11 +1351,12 @@ run_singbox_installer() {
 
     detect_os
     case "$OS" in
-        debian) arch="$(dpkg --print-architecture)"; suffix="deb" ;;
-        alpine) arch="$(apk --print-arch)"; suffix="apk" ;;
-        redhat) arch="$(uname -m)"; suffix="rpm" ;;
+        debian) suffix="deb" ;;
+        alpine) suffix="apk" ;;
+        redhat) suffix="rpm" ;;
         *) err "当前系统不支持 sing-box 固定 Release 安装。"; return 1 ;;
     esac
+    arch="$(singbox_release_package_arch)" || return 1
     asset="sing-box_${version}_linux_${arch}.${suffix}"
     tmp_dir="$(mktemp -d /tmp/vpsbox-sing-box-release.XXXXXX)" || return 1
     tmp="$tmp_dir/$asset"
@@ -1378,11 +1415,12 @@ prepare_singbox_rollback_package() {
     [[ "$version" =~ ^[0-9]+([.][0-9]+){2}$ ]] || return 1
     detect_os
     case "$OS" in
-        debian) arch="$(dpkg --print-architecture)"; suffix="deb" ;;
-        alpine) arch="$(apk --print-arch)"; suffix="apk" ;;
-        redhat) arch="$(uname -m)"; suffix="rpm" ;;
+        debian) suffix="deb" ;;
+        alpine) suffix="apk" ;;
+        redhat) suffix="rpm" ;;
         *) return 1 ;;
     esac
+    arch="$(singbox_release_package_arch)" || return 1
     asset="sing-box_${version}_linux_${arch}.${suffix}"
     package="$backup_dir/$asset"
     download_verified_github_asset "SagerNet/sing-box" "v$version" "$asset" "$package" || return 1
@@ -3296,8 +3334,6 @@ validate_node_transaction_backup() {
                 *) return 1 ;;
             esac
         done < <(find "$config_dir" -mindepth 1 -maxdepth 1 -print 2>/dev/null)
-        command -v sing-box >/dev/null 2>&1 || return 1
-        sing-box check -C "$config_dir" >/dev/null || return 1
     elif [ "$config_dir_present" -eq 1 ]; then
         [ -z "$(find "$config_dir" -mindepth 1 -maxdepth 1 -print 2>/dev/null)" ] || return 1
     fi
@@ -3372,6 +3408,9 @@ prepare_node_transaction_store() {
 }
 
 begin_node_transaction() {
+    local validation_mode="${1:-full}"
+
+    case "$validation_mode" in full|static) ;; *) return 2 ;; esac
     prepare_node_transaction_store || return 1
     if [ -e "$NODE_TRANSACTION_DIR/pending" ]; then
         err "检测到尚未恢复的节点事务，已拒绝开始新操作：$NODE_TRANSACTION_DIR"
@@ -3403,10 +3442,24 @@ begin_node_transaction() {
         remove_node_transaction_dir || true
         return 1
     fi
-    if ! validate_node_transaction_backup "$NODE_TRANSACTION_BACKUP" ||
-        ! sync_node_transaction_store; then
+    if ! validate_node_transaction_backup "$NODE_TRANSACTION_BACKUP"; then
         remove_node_transaction_dir || true
-        err "节点事务备份未通过完整性或持久化检查。"
+        err "节点事务备份未通过完整性检查。"
+        return 1
+    fi
+    if [ "$validation_mode" = "full" ] &&
+        { [ -f "$NODE_TRANSACTION_BACKUP/vpsbox.d/${SS_CONFIG_PATH##*/}" ] ||
+            [ -f "$NODE_TRANSACTION_BACKUP/vpsbox.d/${VLESS_CONFIG_PATH##*/}" ]; }; then
+        if ! command -v sing-box >/dev/null 2>&1 ||
+            ! sing-box check -C "$NODE_TRANSACTION_BACKUP/vpsbox.d" >/dev/null; then
+            remove_node_transaction_dir || true
+            err "节点事务备份未通过 sing-box 配置检查。"
+            return 1
+        fi
+    fi
+    if ! sync_node_transaction_store; then
+        remove_node_transaction_dir || true
+        err "节点事务备份未通过持久化检查。"
         return 1
     fi
     : > "$NODE_TRANSACTION_DIR/pending" || {
@@ -4866,7 +4919,7 @@ EOF
 
 delete_node_protocol() {
     local protocol="$1" label config state uri node_port node_protocols
-    local confirm port_status
+    local confirm port_status transaction_validation="full" singbox_available=1
 
     case "$protocol" in
         vless) label="VLESS Reality"; node_protocols=tcp ;;
@@ -4874,7 +4927,12 @@ delete_node_protocol() {
         *) return 2 ;;
     esac
     if node_artifacts_present; then
-        require_node_commands "删除节点" jq ss sha256sum || return 1
+        if command -v sing-box >/dev/null 2>&1; then
+            require_node_commands "删除节点" jq ss sha256sum || return 1
+        else
+            # 仅清理残留配置不需要监听检查，避免为已卸载的 sing-box 强制要求 ss。
+            require_node_commands "删除节点" jq sha256sum || return 1
+        fi
     fi
     require_valid_node_state_if_present || return 1
     if ! protocol_visible_exists "$protocol"; then
@@ -4892,7 +4950,17 @@ delete_node_protocol() {
     fi
     [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消。"; return 0; }
 
-    if ! begin_node_transaction; then
+    if ! command -v sing-box >/dev/null 2>&1; then
+        singbox_available=0
+        transaction_validation="static"
+        if service_manager_is_active || [ -n "$(singbox_config_pids)" ]; then
+            err "sing-box 未安装，但服务或残留进程仍在运行；为保留回滚能力，已拒绝删除节点。"
+            return 1
+        fi
+        warn "sing-box 未安装；本次只删除已通过静态完整性校验的残留节点配置。"
+    fi
+
+    if ! begin_node_transaction "$transaction_validation"; then
         err "备份当前节点失败，已取消删除。"
         return 1
     fi
@@ -4903,29 +4971,33 @@ delete_node_protocol() {
         return 1
     fi
 
-    service_stop 2>/dev/null ||
-        warn "服务管理器未能正常停止 sing-box，将继续检查 vpsbox 配置对应的进程。"
-    if ! stop_singbox_config_processes; then
-        rollback_active_node_transaction || true
-        err "残留 sing-box 进程无法停止，已保留节点配置。"
-        return 1
+    if [ "$singbox_available" -eq 1 ]; then
+        service_stop 2>/dev/null ||
+            warn "服务管理器未能正常停止 sing-box，将继续检查 vpsbox 配置对应的进程。"
+        if ! stop_singbox_config_processes; then
+            rollback_active_node_transaction || true
+            err "残留 sing-box 进程无法停止，已保留节点配置。"
+            return 1
+        fi
+        sleep 1
     fi
-    sleep 1
     if service_manager_is_active || [ -n "$(singbox_config_pids)" ]; then
         rollback_active_node_transaction || true
         err "sing-box 服务仍在运行，已保留节点配置。"
         return 1
     fi
-    if port_in_use_for_protocols "$node_port" "$node_protocols"; then
-        rollback_active_node_transaction || true
-        err "节点端口 $node_port 仍被其他进程监听，已保留节点配置。"
-        return 1
-    else
-        port_status=$?
-        if [ "$port_status" -ne 1 ]; then
+    if [ "$singbox_available" -eq 1 ]; then
+        if port_in_use_for_protocols "$node_port" "$node_protocols"; then
             rollback_active_node_transaction || true
-            err "无法确认节点端口 $node_port 是否已释放，已保留节点配置。"
+            err "节点端口 $node_port 仍被其他进程监听，已保留节点配置。"
             return 1
+        else
+            port_status=$?
+            if [ "$port_status" -ne 1 ]; then
+                rollback_active_node_transaction || true
+                err "无法确认节点端口 $node_port 是否已释放，已保留节点配置。"
+                return 1
+            fi
         fi
     fi
 
@@ -4944,19 +5016,27 @@ delete_node_protocol() {
     }
 
     if node_exists; then
-        if ! check_node_config_set ||
-            ! setup_service ||
-            ! restart_singbox_cleanly ||
-            ! verify_all_node_runtime; then
+        if [ "$singbox_available" -eq 1 ]; then
+            if ! check_node_config_set ||
+                ! setup_service ||
+                ! restart_singbox_cleanly ||
+                ! verify_all_node_runtime; then
+                rollback_active_node_transaction || true
+                err "剩余节点恢复运行失败，已恢复删除前状态。"
+                return 1
+            fi
+        elif ! require_valid_node_state_if_present; then
             rollback_active_node_transaction || true
-            err "剩余节点恢复运行失败，已恢复删除前状态。"
+            err "剩余节点静态完整性校验失败，已恢复删除前状态。"
             return 1
         fi
     else
-        if ! service_disable || service_is_enabled; then
-            rollback_active_node_transaction || true
-            err "无法禁用 sing-box 开机启动，已恢复删除前状态。"
-            return 1
+        if [ "$singbox_available" -eq 1 ] || service_is_enabled; then
+            if ! service_disable || service_is_enabled; then
+                rollback_active_node_transaction || true
+                err "无法禁用 sing-box 开机启动，已恢复删除前状态。"
+                return 1
+            fi
         fi
         [ "$NODE_CONFIG_DIR" = "$CONFIG_DIR/vpsbox.d" ] &&
             rmdir "$NODE_CONFIG_DIR" 2>/dev/null || true
@@ -4973,9 +5053,17 @@ delete_node_protocol() {
         return 1
     fi
     if node_exists; then
-        info "$label 节点已删除，其他节点继续运行。"
+        if [ "$singbox_available" -eq 1 ]; then
+            info "$label 节点已删除，其他节点继续运行。"
+        else
+            info "$label 节点已删除；其他节点配置已保留，但 sing-box 未安装，当前不会运行。"
+        fi
     else
-        info "$label 节点已删除，sing-box 服务已停止并禁用开机启动。"
+        if [ "$singbox_available" -eq 1 ]; then
+            info "$label 节点已删除，sing-box 服务已停止并禁用开机启动。"
+        else
+            info "$label 节点残留配置已删除；sing-box 未安装，无需停止服务。"
+        fi
     fi
 }
 
@@ -5788,11 +5876,6 @@ fail2ban_install_state() {
 }
 
 fail2ban_service_state() {
-    if ! fail2ban_installed; then
-        echo "未运行"
-        return
-    fi
-
     if is_systemd; then
         if systemctl is-active --quiet fail2ban 2>/dev/null; then
             echo "运行中"
@@ -9247,11 +9330,32 @@ ensure_fail2ban_service_running() {
 }
 
 install_fail2ban() {
+    local original_active original_enabled
+
     detect_os
     if fail2ban_sshd_configuration_healthy; then
         info "Fail2ban SSH 防护已正常运行，无需重复安装或配置。"
         return 0
     fi
+
+    if [ "$(fail2ban_service_state)" = "运行中" ]; then
+        original_active=active
+    else
+        original_active=inactive
+    fi
+    if fail2ban_service_is_enabled; then
+        original_enabled=enabled
+    else
+        original_enabled=disabled
+    fi
+    ensure_change_store || return 1
+    backup_change_file_once FAIL2BAN_SSHD "$FAIL2BAN_VPSBOX_SSHD_CONF" || return 1
+    manifest_set_once FAIL2BAN_ACTIVE "$original_active" || return 1
+    manifest_set_once FAIL2BAN_ENABLED "$original_enabled" || return 1
+    begin_change_transaction FAIL2BAN_SSHD || {
+        err "记录 Fail2ban 安装事务失败，已取消修改。"
+        return 1
+    }
 
     if ! fail2ban_installed; then
         info "正在安装 Fail2ban..."
@@ -9306,6 +9410,10 @@ install_fail2ban() {
         [ "$(fail2ban_service_state)" != "运行中" ] ||
         [ "$(fail2ban_sshd_state)" != "已启用" ]; then
         err "Fail2ban 未达到预期状态，请检查服务日志和 SSH 端口配置。"
+        return 1
+    fi
+    if ! mark_change_applied FAIL2BAN_SSHD; then
+        err "Fail2ban 已启用，但无法记录可恢复状态；变更清单已保留供重试。"
         return 1
     fi
 
@@ -11746,7 +11854,7 @@ firewall_set_body_lines() {
 
     awk -v target="$set_name" '
         $1 == "set" && $2 == target && $3 == "{" { inside=1; next }
-        inside && /^[[:space:]]*}[[:space:]]*$/ { exit }
+        inside && /^[[:space:]]*}[[:space:]]*$/ { inside=0; next }
         inside {
             line=$0
             sub(/^[[:space:]]*/, "", line)
@@ -11808,7 +11916,7 @@ firewall_chain_rule_lines() {
 
     awk -v target="$chain" '
         $1 == "chain" && $2 == target && $3 == "{" { inside=1; next }
-        inside && /^[[:space:]]*}[[:space:]]*$/ { exit }
+        inside && /^[[:space:]]*}[[:space:]]*$/ { inside=0; next }
         inside {
             line=$0
             sub(/^[[:space:]]*/, "", line)
@@ -11817,6 +11925,29 @@ firewall_chain_rule_lines() {
             if (line == "" || line ~ /^type filter hook /) next
             print line
         }
+    '
+}
+
+firewall_chain_base_matches() {
+    local chain="$1" hook="$2" priority="$3" alternate_priority="$4" policy="$5"
+
+    awk -v target="$chain" -v hook="$hook" -v priority="$priority" \
+        -v alternate="$alternate_priority" -v policy="$policy" '
+        $1 == "chain" && $2 == target && $3 == "{" { inside=1; next }
+        inside && /^[[:space:]]*}[[:space:]]*$/ { inside=0; next }
+        inside {
+            line=$0
+            sub(/^[[:space:]]*/, "", line)
+            sub(/[[:space:]]*$/, "", line)
+            gsub(/[[:space:]]+/, " ", line)
+            expected="type filter hook " hook " priority " priority "; policy " policy ";"
+            if (line == expected) matched=1
+            if (alternate != "") {
+                expected="type filter hook " hook " priority " alternate "; policy " policy ";"
+                if (line == expected) matched=1
+            }
+        }
+        END { exit !matched }
     '
 }
 
@@ -12283,31 +12414,100 @@ firewall_config_matches_expected() {
     [ "$status" -eq 0 ]
 }
 
+firewall_live_set_ports_from_table() {
+    local table_rules="$1" set_name="$2"
+    local set_names body guard_rules
+
+    set_names="$(printf '%s\n' "$table_rules" | firewall_table_object_names set)" || return 1
+    case ",$set_names," in
+        *",$set_name,"*) ;;
+        *) return 0 ;;
+    esac
+    body="$(printf '%s\n' "$table_rules" | firewall_set_body_lines "$set_name")" || return 1
+    guard_rules="$(printf '%s\n' "$table_rules" | firewall_chain_rule_lines docker_port_guard)" || return 1
+    grep -Fq "@$set_name accept" <<< "$guard_rules" || return 1
+    printf '%s\n' "$body" | firewall_discrete_port_set_values
+}
+
+firewall_read_live_allowed_ports() {
+    local table_rules input_rules forward_rules
+    local docker4_tcp docker4_udp docker6_tcp docker6_udp
+
+    FW_LIVE_INPUT_TCP=""
+    FW_LIVE_INPUT_UDP=""
+    FW_LIVE_DOCKER_TCP=""
+    FW_LIVE_DOCKER_UDP=""
+    FW_LIVE_EXTRA_DNAT_TCP=""
+    FW_LIVE_EXTRA_DNAT_UDP=""
+
+    table_rules="$(nft -nn list table inet vpsbox 2>/dev/null)" || return 1
+    case ",$(printf '%s\n' "$table_rules" | firewall_table_object_names chain)," in
+        *,input,*) ;;
+        *) return 1 ;;
+    esac
+    firewall_chain_base_matches input input filter 0 drop <<< "$table_rules" || return 1
+    input_rules="$(printf '%s\n' "$table_rules" | firewall_chain_rule_lines input)" || return 1
+    FW_LIVE_INPUT_TCP="$(printf '%s\n' "$input_rules" | firewall_ports_from_nft_chain tcp)" || return 1
+    FW_LIVE_INPUT_UDP="$(printf '%s\n' "$input_rules" | firewall_ports_from_nft_chain udp)" || return 1
+
+    docker4_tcp="$(firewall_live_set_ports_from_table "$table_rules" docker4_tcp_ports)" || return 1
+    docker4_udp="$(firewall_live_set_ports_from_table "$table_rules" docker4_udp_ports)" || return 1
+    docker6_tcp="$(firewall_live_set_ports_from_table "$table_rules" docker6_tcp_ports)" || return 1
+    docker6_udp="$(firewall_live_set_ports_from_table "$table_rules" docker6_udp_ports)" || return 1
+    FW_LIVE_DOCKER_TCP="$(merge_port_csv "$docker4_tcp" "$docker6_tcp")" || return 1
+    FW_LIVE_DOCKER_UDP="$(merge_port_csv "$docker4_udp" "$docker6_udp")" || return 1
+    FW_LIVE_EXTRA_DNAT_TCP="$(firewall_live_set_ports_from_table "$table_rules" extra_tcp_dnat_ports)" || return 1
+    FW_LIVE_EXTRA_DNAT_UDP="$(firewall_live_set_ports_from_table "$table_rules" extra_udp_dnat_ports)" || return 1
+
+    if [ -n "$FW_LIVE_DOCKER_TCP$FW_LIVE_DOCKER_UDP$FW_LIVE_EXTRA_DNAT_TCP$FW_LIVE_EXTRA_DNAT_UDP" ]; then
+        firewall_chain_base_matches docker_forward forward -1 "filter - 1" accept <<< "$table_rules" || return 1
+        forward_rules="$(printf '%s\n' "$table_rules" | firewall_chain_rule_lines docker_forward)" || return 1
+        grep -Fq 'jump docker_port_guard' <<< "$forward_rules" || return 1
+    fi
+}
+
 firewall_view_rules() {
-    firewall_load_state || return 1
-    firewall_detect_allowed_ports || return 1
+    local runtime_state persistence_state
+
+    if firewall_runtime_enabled; then
+        runtime_state="运行中"
+        if ! firewall_read_live_allowed_ports; then
+            err "无法可靠读取当前 nftables 放行规则。"
+            return 1
+        fi
+    else
+        runtime_state="$(firewall_runtime_state)"
+        FW_LIVE_INPUT_TCP=""
+        FW_LIVE_INPUT_UDP=""
+        FW_LIVE_DOCKER_TCP=""
+        FW_LIVE_DOCKER_UDP=""
+        FW_LIVE_EXTRA_DNAT_TCP=""
+        FW_LIVE_EXTRA_DNAT_UDP=""
+    fi
+    persistence_state="$(firewall_persistence_state)"
     cat <<EOF
 ========================================
  当前放行端口
 ========================================
- 来源       协议       端口
+ 类型           协议       端口
 ----------------------------------------
- SSH        TCP        ${FW_SSH_PORTS:--}
- 节点       TCP        ${FW_NODE_TCP:--}
- 节点       UDP        ${FW_NODE_UDP:--}
- Docker     TCP        ${FW_DOCKER_PUBLIC_TCP:--}
- Docker     UDP        ${FW_DOCKER_PUBLIC_UDP:--}
- 其他公网   TCP        ${FW_OTHER_PUBLIC_TCP:--}
- 其他公网   UDP        ${FW_OTHER_PUBLIC_UDP:--}
- 额外端口   TCP        ${FW_EXTRA_TCP:--}
- 额外端口   UDP        ${FW_EXTRA_UDP:--}
+ 主机入站       TCP        ${FW_LIVE_INPUT_TCP:--}
+ 主机入站       UDP        ${FW_LIVE_INPUT_UDP:--}
+ Docker 转发    TCP        ${FW_LIVE_DOCKER_TCP:--}
+ Docker 转发    UDP        ${FW_LIVE_DOCKER_UDP:--}
+ 额外 DNAT      TCP        ${FW_LIVE_EXTRA_DNAT_TCP:--}
+ 额外 DNAT      UDP        ${FW_LIVE_EXTRA_DNAT_UDP:--}
 ----------------------------------------
- 防火墙：$(firewall_runtime_state)
- 开机加载：$(firewall_persistence_state)
+ 防火墙：$runtime_state
+ 开机加载：$persistence_state
  出站规则：不创建
 ========================================
 EOF
-    echo "说明：这里只显示 VPS 内部规则；NAT 端口映射和商家安全组需单独设置。"
+    if [ "$runtime_state" = "运行中" ]; then
+        echo "说明：以上端口直接读取自当前 nftables 规则；新增服务后需执行 [1] 才会放行。"
+    else
+        echo "说明：当前没有正在生效的 vpsbox 防火墙规则；NAT 映射和商家安全组需单独设置。"
+    fi
 }
 
 firewall_save_inactive_state() {
@@ -12995,10 +13195,18 @@ detect_trace_line() {
 }
 
 nexttrace_supports_size_compare() {
-    local help flag
+    local help flag status=0
     local -a missing=()
 
-    help="$(nexttrace --help 2>&1 || true)"
+    if help="$(run_bounded_command "$NEXTTRACE_HELP_TIMEOUT" nexttrace --help 2>&1)"; then
+        :
+    else
+        status=$?
+    fi
+    if [ "$status" -ne 0 ]; then
+        err "无法在 ${NEXTTRACE_HELP_TIMEOUT} 秒内可靠读取 nexttrace 参数列表。"
+        return 1
+    fi
     if [ -z "$help" ]; then
         err "无法读取 nexttrace 参数列表。"
         return 1

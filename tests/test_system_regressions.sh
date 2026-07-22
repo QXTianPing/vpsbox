@@ -817,6 +817,28 @@ test_nexttrace_probe_uses_bounded_command() {
     )
 }
 
+test_nexttrace_help_uses_bounded_command_and_propagates_timeout() {
+    (
+        local log="$TEST_TMP/nexttrace-help-bounded.log"
+        run_bounded_command() {
+            printf '%s\n' "$*" > "$log"
+            printf '%s\n' '--psize --source-port --parallel-requests --queries'
+        }
+
+        nexttrace_supports_size_compare || fail "有界帮助输出包含必需参数时应通过"
+        assert_file_contains "$log" "^${NEXTTRACE_HELP_TIMEOUT} nexttrace --help$"
+    )
+    (
+        local output="$TEST_TMP/nexttrace-help-timeout.out"
+        run_bounded_command() { return 124; }
+
+        if nexttrace_supports_size_compare > "$output" 2>&1; then
+            fail "读取 nexttrace 帮助超时时不得继续测试"
+        fi
+        assert_file_contains "$output" "无法在 ${NEXTTRACE_HELP_TIMEOUT} 秒内可靠读取"
+    )
+}
+
 test_hostname_failure_restores_current_operation_state() {
     (
         local runtime_hostname="first.example" fail_hosts_publish=1
@@ -959,6 +981,7 @@ main() {
         test_ssh_restore_snapshot_integrity_is_verified
         test_dns_verification_uses_bounded_command
         test_nexttrace_probe_uses_bounded_command
+        test_nexttrace_help_uses_bounded_command_and_propagates_timeout
         test_hostname_failure_restores_current_operation_state
         test_signal_traps_preserve_exit_status
         test_uninstall_restore_offer_runs_internal_restore

@@ -444,6 +444,155 @@ test_delete_last_protocol_disables_service() {
     )
 }
 
+test_delete_residual_node_without_singbox_keeps_sibling_static() {
+    (
+        local event_log="$TEST_TMP/delete-without-singbox.events"
+        local output="$TEST_TMP/delete-without-singbox.out"
+        set_node_paths "$TEST_TMP/delete-without-singbox"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_vless_config_fixture "$VLESS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        write_vless_state_fixture "$VLESS_STATE_FILE"
+        write_uri_files
+        : > "$event_log"
+
+        command() {
+            if [ "${1:-}" = -v ]; then
+                case "${2:-}" in sing-box|ss) return 1 ;; esac
+            fi
+            builtin command "$@"
+        }
+        missing_node_commands() {
+            local command_name
+            for command_name in "$@"; do
+                [ "$command_name" != ss ] || { printf 'ss\n'; return 0; }
+            done
+            printf '\n'
+        }
+        # shellcheck disable=SC2120 # 调用来自运行时 source 的生产函数。
+        begin_node_transaction() { printf 'transaction:%s\n' "$1" >> "$event_log"; }
+        mark_node_transaction_mutated() { printf '%s\n' mutated >> "$event_log"; }
+        commit_node_transaction() { printf '%s\n' commit >> "$event_log"; }
+        rollback_active_node_transaction() { printf '%s\n' rollback >> "$event_log"; }
+        firewall_prepare_port_transition() { printf '%s\n' prepare >> "$event_log"; }
+        firewall_complete_port_transition() { printf '%s\n' complete >> "$event_log"; }
+        service_manager_is_active() { return 1; }
+        singbox_config_pids() { return 0; }
+        service_stop() { printf '%s\n' unexpected:service-stop >> "$event_log"; return 1; }
+        stop_singbox_config_processes() { printf '%s\n' unexpected:process-stop >> "$event_log"; return 1; }
+        port_in_use_for_protocols() { printf '%s\n' unexpected:port-check >> "$event_log"; return 1; }
+        setup_service() { printf '%s\n' unexpected:setup >> "$event_log"; return 1; }
+        restart_singbox_cleanly() { printf '%s\n' unexpected:restart >> "$event_log"; return 1; }
+        verify_all_node_runtime() { printf '%s\n' unexpected:verify >> "$event_log"; return 1; }
+
+        delete_vless_reality_node <<< y > "$output"
+
+        [ ! -e "$VLESS_CONFIG_PATH" ] && [ ! -e "$VLESS_STATE_FILE" ] ||
+            fail "sing-box 缺失时应能删除目标残留节点"
+        [ -e "$SS_CONFIG_PATH" ] && [ -e "$SS_STATE_FILE" ] ||
+            fail "sing-box 缺失时必须保留兄弟节点配置"
+        assert_file_contains "$event_log" '^transaction:static$'
+        assert_file_contains "$event_log" '^complete$'
+        assert_file_not_contains "$event_log" '^(unexpected:|rollback$)'
+        assert_file_contains "$output" '其他节点配置已保留，但 sing-box 未安装，当前不会运行'
+    )
+}
+
+test_delete_last_residual_node_without_singbox_skips_missing_service() {
+    (
+        local event_log="$TEST_TMP/delete-last-without-singbox.events"
+        local output="$TEST_TMP/delete-last-without-singbox.out"
+        set_node_paths "$TEST_TMP/delete-last-without-singbox"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_vless_config_fixture "$VLESS_CONFIG_PATH"
+        write_vless_state_fixture "$VLESS_STATE_FILE"
+        write_uri_files
+        : > "$event_log"
+
+        command() {
+            if [ "${1:-}" = -v ]; then
+                case "${2:-}" in sing-box|ss) return 1 ;; esac
+            fi
+            builtin command "$@"
+        }
+        # shellcheck disable=SC2120 # 调用来自运行时 source 的生产函数。
+        begin_node_transaction() { printf 'transaction:%s\n' "$1" >> "$event_log"; }
+        mark_node_transaction_mutated() { printf '%s\n' mutated >> "$event_log"; }
+        commit_node_transaction() { printf '%s\n' commit >> "$event_log"; }
+        rollback_active_node_transaction() { printf '%s\n' rollback >> "$event_log"; }
+        firewall_prepare_port_transition() { printf '%s\n' prepare >> "$event_log"; }
+        firewall_complete_port_transition() { printf '%s\n' complete >> "$event_log"; }
+        service_manager_is_active() { return 1; }
+        service_is_enabled() { return 1; }
+        singbox_config_pids() { return 0; }
+        port_in_use_for_protocols() { printf '%s\n' unexpected:port-check >> "$event_log"; return 1; }
+        service_stop() { printf '%s\n' unexpected:service-stop >> "$event_log"; return 1; }
+        service_disable() { printf '%s\n' unexpected:disable >> "$event_log"; return 1; }
+        stop_singbox_config_processes() { printf '%s\n' unexpected:process-stop >> "$event_log"; return 1; }
+
+        delete_vless_reality_node <<< y > "$output"
+
+        [ ! -e "$VLESS_CONFIG_PATH" ] && [ ! -e "$VLESS_STATE_FILE" ] ||
+            fail "sing-box 缺失时应能删除最后一个残留节点"
+        assert_file_contains "$event_log" '^transaction:static$'
+        assert_file_contains "$event_log" '^complete$'
+        assert_file_not_contains "$event_log" '^(unexpected:|rollback$)'
+        assert_file_contains "$output" 'sing-box 未安装，无需停止服务'
+    )
+}
+
+test_static_node_backup_validation_does_not_execute_singbox() {
+    (
+        local backup="$TEST_TMP/static-backup-validation/backup"
+        set_node_paths "$TEST_TMP/static-backup-validation/node"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        write_uri_files
+        service_is_running() { return 1; }
+        service_is_enabled() { return 1; }
+        sing-box() { fail "静态事务备份校验不得执行 sing-box"; }
+
+        backup_node_files "$backup"
+        validate_node_transaction_backup "$backup" ||
+            fail "没有 sing-box 时，哈希及配置状态一致的备份应通过静态校验"
+        printf '%s\n' tampered >> "$backup/ss-state.env"
+        if validate_node_transaction_backup "$backup"; then
+            fail "静态校验仍必须拒绝哈希被篡改的备份"
+        fi
+    )
+}
+
+test_node_transaction_full_and_static_validation_modes() {
+    (
+        set_node_paths "$TEST_TMP/transaction-validation-modes"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        write_uri_files
+        service_is_running() { return 1; }
+        service_is_enabled() { return 1; }
+        sing-box() {
+            [ "${1:-}" != check ] || return 1
+        }
+
+        begin_node_transaction static ||
+            fail "静态事务校验不应依赖 sing-box check"
+        [ -f "$NODE_TRANSACTION_DIR/pending" ] ||
+            fail "静态事务校验成功后应建立 pending 标记"
+        cancel_unmodified_node_transaction ||
+            fail "静态事务测试完成后应能清理未修改事务"
+
+        if begin_node_transaction full > "$TEST_TMP/full-transaction-check.out" 2>&1; then
+            fail "完整事务校验必须拒绝 sing-box check 失败的备份"
+        fi
+        [ ! -e "$NODE_TRANSACTION_DIR" ] ||
+            fail "完整事务校验失败后不得保留未生效事务目录"
+        assert_file_contains "$TEST_TMP/full-transaction-check.out" '未通过 sing-box 配置检查'
+    )
+}
+
 test_dual_node_backup_restore_round_trip() {
     (
         local backup="$TEST_TMP/dual-backup"
@@ -952,6 +1101,10 @@ main() {
         test_stopped_target_port_is_rechecked_against_system_listeners
         test_delete_one_protocol_keeps_sibling_running
         test_delete_last_protocol_disables_service
+        test_delete_residual_node_without_singbox_keeps_sibling_static
+        test_delete_last_residual_node_without_singbox_skips_missing_service
+        test_static_node_backup_validation_does_not_execute_singbox
+        test_node_transaction_full_and_static_validation_modes
         test_dual_node_backup_restore_round_trip
         test_verify_runtime_checks_both_protocols
         test_cancel_eof_and_input_interrupt_have_no_mutation

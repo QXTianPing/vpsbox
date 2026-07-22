@@ -426,11 +426,144 @@ test_installed_fail2ban_repairs_without_package_manager() {
         fail2ban_service_state() { printf '运行中\n'; }
         fail2ban_sshd_state() { printf '已启用\n'; }
         ssh_effective_ports_csv() { printf '22222\n'; }
+        ensure_change_store() { printf '%s\n' change-store >> "$log"; }
+        backup_change_file_once() { printf 'backup:%s\n' "$1" >> "$log"; }
+        manifest_set_once() { printf 'manifest:%s=%s\n' "$1" "$2" >> "$log"; }
+        begin_change_transaction() { printf 'begin:%s\n' "$1" >> "$log"; }
+        mark_change_applied() { printf 'applied:%s\n' "$1" >> "$log"; }
 
         install_fail2ban >/dev/null
         assert_file_contains "$log" '^service$'
         assert_file_contains "$log" '^sync$'
         assert_file_not_contains "$log" '^package$' "已安装时不得访问软件源"
+    )
+}
+
+test_install_fail2ban_records_service_state_before_mutation() {
+    (
+        local log="$TEST_TMP/fail2ban-install-baseline.log"
+        local running=0 enabled=0
+        : > "$log"
+        detect_os() { OS=debian; }
+        fail2ban_sshd_configuration_healthy() { return 1; }
+        fail2ban_installed() { return 0; }
+        fail2ban_service_state() {
+            [ "$running" -eq 1 ] && printf '运行中\n' || printf '未运行\n'
+        }
+        fail2ban_service_is_enabled() { [ "$enabled" -eq 1 ]; }
+        ensure_change_store() { printf '%s\n' change-store >> "$log"; }
+        backup_change_file_once() { printf 'backup:%s\n' "$1" >> "$log"; }
+        manifest_set_once() { printf 'manifest:%s=%s\n' "$1" "$2" >> "$log"; }
+        begin_change_transaction() { printf 'begin:%s\n' "$1" >> "$log"; }
+        ensure_fail2ban_service_running() {
+            printf '%s\n' service-mutation >> "$log"
+            running=1
+            enabled=1
+        }
+        sync_fail2ban_sshd_port() { printf '%s\n' sync >> "$log"; }
+        fail2ban_sshd_state() { printf '已启用\n'; }
+        ssh_effective_ports_csv() { printf '22222\n'; }
+        mark_change_applied() { printf 'applied:%s\n' "$1" >> "$log"; }
+
+        install_fail2ban >/dev/null
+
+        assert_file_contains "$log" '^manifest:FAIL2BAN_ACTIVE=inactive$'
+        assert_file_contains "$log" '^manifest:FAIL2BAN_ENABLED=disabled$'
+        assert_file_contains "$log" '^begin:FAIL2BAN_SSHD$'
+        assert_file_contains "$log" '^applied:FAIL2BAN_SSHD$'
+        [ "$(grep -n '^manifest:FAIL2BAN_ACTIVE=' "$log" | cut -d: -f1)" -lt \
+            "$(grep -n '^service-mutation$' "$log" | cut -d: -f1)" ] ||
+            fail "Fail2ban 运行状态必须在服务启动前记录"
+        [ "$(grep -n '^manifest:FAIL2BAN_ENABLED=' "$log" | cut -d: -f1)" -lt \
+            "$(grep -n '^service-mutation$' "$log" | cut -d: -f1)" ] ||
+            fail "Fail2ban 自启状态必须在服务启用前记录"
+    )
+}
+
+test_fail2ban_service_state_does_not_require_client_binary() {
+    (
+        fail2ban_installed() { return 1; }
+        is_systemd() { return 0; }
+        systemctl() {
+            [ "${1:-}" = is-active ] && [ "${3:-}" = fail2ban ]
+        }
+
+        assert_eq "运行中" "$(fail2ban_service_state)" \
+            "fail2ban-client 缺失时仍应按服务管理器记录真实运行状态"
+    )
+}
+
+test_install_fail2ban_first_install_records_baseline_before_package_mutation() {
+    (
+        local log="$TEST_TMP/fail2ban-first-install-baseline.log"
+        local installed=0 running=0 enabled=0
+        local manifest_active_line manifest_enabled_line begin_line package_line
+        : > "$log"
+        detect_os() { OS=debian; }
+        fail2ban_sshd_configuration_healthy() { return 1; }
+        fail2ban_installed() { [ "$installed" -eq 1 ]; }
+        fail2ban_service_state() {
+            [ "$running" -eq 1 ] && printf '运行中\n' || printf '未运行\n'
+        }
+        fail2ban_service_is_enabled() { [ "$enabled" -eq 1 ]; }
+        ensure_change_store() { printf '%s\n' change-store >> "$log"; }
+        backup_change_file_once() { printf 'backup:%s\n' "$1" >> "$log"; }
+        manifest_set_once() { printf 'manifest:%s=%s\n' "$1" "$2" >> "$log"; }
+        begin_change_transaction() { printf 'begin:%s\n' "$1" >> "$log"; }
+        apt_get_bounded() {
+            if [ "${2:-}" = install ]; then
+                printf '%s\n' package-mutation >> "$log"
+                installed=1
+                running=1
+                enabled=1
+            fi
+        }
+        ensure_fail2ban_service_running() { printf '%s\n' service-check >> "$log"; }
+        sync_fail2ban_sshd_port() { printf '%s\n' sync >> "$log"; }
+        fail2ban_sshd_state() { printf '已启用\n'; }
+        ssh_effective_ports_csv() { printf '22222\n'; }
+        mark_change_applied() { printf 'applied:%s\n' "$1" >> "$log"; }
+
+        install_fail2ban >/dev/null
+
+        assert_file_contains "$log" '^manifest:FAIL2BAN_ACTIVE=inactive$'
+        assert_file_contains "$log" '^manifest:FAIL2BAN_ENABLED=disabled$'
+        assert_file_contains "$log" '^begin:FAIL2BAN_SSHD$'
+        assert_file_contains "$log" '^package-mutation$'
+        manifest_active_line="$(grep -n '^manifest:FAIL2BAN_ACTIVE=' "$log" | cut -d: -f1)"
+        manifest_enabled_line="$(grep -n '^manifest:FAIL2BAN_ENABLED=' "$log" | cut -d: -f1)"
+        begin_line="$(grep -n '^begin:FAIL2BAN_SSHD$' "$log" | cut -d: -f1)"
+        package_line="$(grep -n '^package-mutation$' "$log" | cut -d: -f1)"
+        [ "$manifest_active_line" -lt "$package_line" ] &&
+            [ "$manifest_enabled_line" -lt "$package_line" ] &&
+            [ "$begin_line" -lt "$package_line" ] ||
+            fail "Fail2ban 首次安装前必须先记录运行、自启基线并建立事务"
+    )
+}
+
+test_install_fail2ban_failure_keeps_pending_baseline() {
+    (
+        local log="$TEST_TMP/fail2ban-install-pending.log"
+        : > "$log"
+        detect_os() { OS=debian; }
+        fail2ban_sshd_configuration_healthy() { return 1; }
+        fail2ban_installed() { return 0; }
+        fail2ban_service_state() { printf '未运行\n'; }
+        fail2ban_service_is_enabled() { return 1; }
+        ensure_change_store() { :; }
+        backup_change_file_once() { printf 'backup:%s\n' "$1" >> "$log"; }
+        manifest_set_once() { printf 'manifest:%s=%s\n' "$1" "$2" >> "$log"; }
+        begin_change_transaction() { printf 'pending:%s\n' "$1" >> "$log"; }
+        ensure_fail2ban_service_running() { return 42; }
+        mark_change_applied() { printf '%s\n' applied >> "$log"; }
+
+        if install_fail2ban >/dev/null 2>&1; then
+            fail "Fail2ban 服务启动失败时安装流程不得成功"
+        fi
+        assert_file_contains "$log" '^pending:FAIL2BAN_SSHD$'
+        assert_file_not_contains "$log" '^applied$' "失败后不得把事务标记为已应用"
+        assert_file_contains "$log" '^manifest:FAIL2BAN_ACTIVE=inactive$'
+        assert_file_contains "$log" '^manifest:FAIL2BAN_ENABLED=disabled$'
     )
 }
 
@@ -504,6 +637,10 @@ main() {
         test_fail2ban_health_requires_canonical_current_config
         test_install_fail2ban_healthy_is_noop
         test_installed_fail2ban_repairs_without_package_manager
+        test_install_fail2ban_records_service_state_before_mutation
+        test_fail2ban_service_state_does_not_require_client_binary
+        test_install_fail2ban_first_install_records_baseline_before_package_mutation
+        test_install_fail2ban_failure_keeps_pending_baseline
         test_fail2ban_backup_rotation_keeps_five
         test_fail2ban_atomic_restore_preserves_current_on_failure
         test_fail2ban_rollback_failure_is_reported

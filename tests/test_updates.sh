@@ -569,6 +569,34 @@ test_singbox_version_guards() {
     assert_file_contains "$MOCK_SINGBOX_EVENT_LOG" '^installer:1\.13\.14$'
 }
 
+test_singbox_redhat_release_arch_mapping() {
+    local input expected actual
+    local -a cases=(
+        amd64 x86_64 arm64 aarch64 armv7 armv7hl armv7l armv7hl
+        armv6 armv6hl armv6l armv6hl i386 i386 i486 i386 i586 i386 i686 i386
+        ppc64el ppc64le mips64le mips64el x86_64 x86_64 aarch64 aarch64
+        loongarch64 loongarch64 mips64el mips64el mipsel mipsel ppc64le ppc64le
+        riscv64 riscv64 s390x s390x
+    )
+
+    export OS=redhat
+    while [ "${#cases[@]}" -gt 0 ]; do
+        input="${cases[0]}"
+        expected="${cases[1]}"
+        cases=("${cases[@]:2}")
+        uname() { printf '%s\n' "$input"; }
+        actual="$(singbox_release_package_arch)" ||
+            fail "RedHat 架构 $input 应有对应 RPM"
+        assert_eq "$expected" "$actual" "RedHat RPM 架构映射错误：$input"
+    done
+
+    uname() { printf '%s\n' sparc64; }
+    if singbox_release_package_arch > "$TEST_TMP/singbox-unsupported-arch.out" 2>&1; then
+        fail "没有官方 RPM 的 RedHat 架构必须被拒绝"
+    fi
+    assert_file_contains "$TEST_TMP/singbox-unsupported-arch.out" '没有对应的 sing-box RPM：sparc64'
+}
+
 main() {
     local test status passed=0
     local -a tests=(
@@ -589,6 +617,7 @@ main() {
         test_stale_previous_without_handshake_is_ignored
         test_pending_update_rejects_unexpected_backup_path
         test_singbox_version_guards
+        test_singbox_redhat_release_arch_mapping
     )
 
     for test in "${tests[@]}"; do
